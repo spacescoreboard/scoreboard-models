@@ -136,7 +136,7 @@ def ecmwf(cyc):
     if 0 not in P: P[0] = np.zeros_like(next(iter(P.values()))); S[0] = np.zeros_like(P[0])
     return dict(lat=lat, lon=lon, T=T, P=P, S=S, run=cyc, snow_note="ECMWF snowfall" if snow_native else "ECMWF snow from temperature")
 
-# ---------------------------------------------------------------- Canadian GDPS / GEM (Open Government Licence – Canada)
+# ---------------------------------------------------------------- Canadian GDPS / GEM (ECCC Data Server End-use Licence)
 def gem(cyc):
     hh = cyc.strftime("%H"); base = f"https://dd.weather.gc.ca/today/model_gdps/15km/{hh}/"
     listing = get(base + "024/", ok404=True)
@@ -304,7 +304,7 @@ def draw(models, totals, force=False):
             fig.text(0.25 + 0.5 * i / len(COLORS), 0.035, "0.1" if v == 0.1 else str(v), fontsize=8.5, fontfamily=BODY, color=SLATE, ha="center")
         fig.text(0.755, 0.064, "inches of snow (10:1)", fontsize=9, fontfamily=BODY, color=SLATE)
         fig.text(0.025, 0.02, "WeatherScoreboard.com", fontfamily=HEAD, fontsize=11, fontweight="heavy", color=INK)
-        fig.text(0.975, 0.02, "Data: NOAA GFS · ECMWF open data (CC BY 4.0) · Environment and Climate Change Canada", fontfamily=BODY, fontsize=8.5, color=SLATE, ha="right")
+        fig.text(0.975, 0.02, "Data: NOAA GFS · © ECMWF, CC BY 4.0 · Environment and Climate Change Canada · snow totals by Weather Scoreboard", fontfamily=BODY, fontsize=8.5, color=SLATE, ha="right")
         fig.canvas.draw(); im = Image.frombuffer("RGBA", fig.canvas.get_width_height(), fig.canvas.buffer_rgba()).convert("RGB")
         im.save(os.path.join(OUT, f"frame{len(frames):03d}.png")); frames.append(im); plt.close(fig)
 
