@@ -3,7 +3,8 @@
 Twice a day (see .github/workflows/models.yml) this script:
   1. downloads the next 72 hours of three forecast models: the American GFS (NOAA), the European IFS (ECMWF open
      data) and the Canadian GDPS/GEM (Environment and Climate Change Canada);
-  2. reads each model's forecast for every Weather Scoreboard city for 7 days (temperature, rain and melted snow,
+  2. adds the National Weather Service's own forecast grids and NOAA's HRRR (both about 2 miles apart);
+  3. reads each model's forecast for every Weather Scoreboard city for 7 days (temperature, rain and melted snow,
      snow; every 3 hours, then every 6 on day 7), which the website keeps to grade the models later, and saves
      each model's grids for the lower 48 for the website's interactive map;
   3. when a storm is coming (4 inches or more for a big city in any model), draws the animated "model fight"
@@ -172,12 +173,132 @@ def gem(cyc):
     for f in STEPS[1:]: S[f] = S[PREV[f]] + np.clip(P[f] - P[PREV[f]], 0, None) * (T[f] <= 33) * 10
     return dict(lat=lat, lon=lon, T=T, P=P, S=S, run=cyc, snow_note="GEM snow from temperature")
 
+# ---------------------------------------------------------------- high-detail sources: NWS forecast grids and HRRR
+# Both come on projected grids (Lambert conformal, about 2.5 and 3 km), kept whole, with the projection, so they can be
+# sampled at any point. Values are lined up with STEPS (hours after `start`, the global models' run); where a source
+# has no forecast for a step (HRRR past 48 hours, NWS snow and rain past 72), the value is missing (NaN).
+def grib_proj(blob):
+    """Messages of a GRIB2 blob on one projected grid: (lats, lons, projparams, [message dicts with values])."""
+    import pygrib
+    path = os.path.join(OUT, "tmp.grib2"); open(path, "wb").write(blob)
+    out = []; lats = lons = proj = None
+    with pygrib.open(path) as g:
+        for m in g:
+            if lats is None: lats, lons = m.latlons(); proj = m.projparams
+            try: s0, s1 = int(m.startStep), int(m.endStep)
+            except Exception: s0 = s1 = int(getattr(m, "step", 0))
+            ana = m.analDate.replace(tzinfo=dt.timezone.utc)
+            out.append(dict(name=m.shortName, s0=s0, s1=s1, t0=ana + dt.timedelta(hours=s0), t1=ana + dt.timedelta(hours=s1),
+                            values=np.array(np.ma.filled(m.values.astype("float32"), np.nan))))
+    return lats, lons, proj, out
+
+def nws(start):
+    """The National Weather Service's own forecast grids (NDFD, CONUS 2.5 km, public domain): temperature for 7 days,
+    rain and melted snow (QPF) and snow for 3 days. Snow is the NWS forecasters' own snow amount."""
+    base = "https://tgftp.nws.noaa.gov/SL.us008001/ST.opnl/DF.gr2/DC.ndfd/AR.conus/"
+    def read(vp, el):
+        blob = get(base + vp + "/ds." + el + ".bin", timeout=300)
+        if not blob: raise RuntimeError(f"NDFD {vp} {el} not available")
+        return grib_proj(blob)
+    lats, lons, proj, temp = read("VP.001-003", "temp")
+    try: temp += read("VP.004-007", "temp")[3]
+    except Exception as e: log("  NWS days 4-7 temperature:", str(e)[:120])
+    qpf, snow = read("VP.001-003", "qpf")[3], read("VP.001-003", "snow")[3]
+    T, P, S = {}, {}, {}
+    tv = sorted(((m["t1"], m["values"]) for m in temp), key=lambda x: x[0])
+    times = [t for t, _ in tv]
+    for f in STEPS:
+        t = start + dt.timedelta(hours=f)
+        if t < times[0] or t > times[-1]: T[f] = None; continue
+        j = next(i for i, x in enumerate(times) if x >= t)
+        if times[j] == t or j == 0: T[f] = (tv[j][1] - 273.15) * 9 / 5 + 32
+        else:  # between two forecast times: blend
+            a = (t - times[j - 1]).total_seconds() / (times[j] - times[j - 1]).total_seconds()
+            T[f] = ((tv[j - 1][1] * (1 - a) + tv[j][1] * a) - 273.15) * 9 / 5 + 32
+    def accum(periods, scale, store):
+        end = max(m["t1"] for m in periods)
+        for f in STEPS:
+            t = start + dt.timedelta(hours=f)
+            if t > end: store[f] = None; continue
+            tot = np.zeros_like(periods[0]["values"])
+            for m in periods:  # the part of each period that falls between `start` and t
+                a, b = max(m["t0"], start), min(m["t1"], t)
+                if b <= a: continue
+                tot += np.nan_to_num(m["values"]) * ((b - a).total_seconds() / (m["t1"] - m["t0"]).total_seconds())
+            store[f] = tot * scale
+    accum(qpf, 1 / 25.4, P)          # kg/m² (mm) → inches
+    accum(snow, 39.37, S)            # metres of snow → inches
+    return dict(lat=lats, lon=lons, proj=proj, T=T, P=P, S=S, run=max(m["t0"] for m in temp[:1]), snow_note="NWS forecast snow amount")
+
+def hrrr(start):
+    """NOAA's HRRR (3 km, public domain), the newest 48-hour run (00, 06, 12 or 18Z). Snow is precipitation the HRRR
+    calls snow, at 10:1, like the GFS. Totals count from the HRRR run's own start."""
+    now = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+    c0 = now.replace(minute=0, second=0, microsecond=0, hour=now.hour // 6 * 6)
+    for cyc in (c0, c0 - dt.timedelta(hours=6), c0 - dt.timedelta(hours=12)):
+        try:
+            ymd, hh = cyc.strftime("%Y%m%d"), cyc.strftime("%H")
+            T, P, S = {}, {}, {}; tot = {0: 0}; lats = lons = proj = None
+            for fh in range(3, 49, 3):
+                url = ("https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl?dir=%2Fhrrr." + ymd + "%2Fconus"
+                       f"&file=hrrr.t{hh}z.wrfsfcf{fh:02d}.grib2&var_TMP=on&var_APCP=on&var_CSNOW=on&lev_2_m_above_ground=on&lev_surface=on")
+                blob = get(url, ok404=True)
+                if not blob: raise RuntimeError(f"HRRR {hh}Z f{fh:02d} not available")
+                lats, lons, proj, msgs = grib_proj(blob); time.sleep(1)
+                frac = None
+                for m in msgs:
+                    if m["name"] == "2t": T[fh] = (m["values"] - 273.15) * 9 / 5 + 32
+                    elif m["name"] == "csnow": frac = m["values"]
+                    elif m["name"] == "tp" and m["s0"] in tot: tot[m["s1"]] = tot[m["s0"]] + m["values"]
+                if fh not in tot or fh not in T: raise RuntimeError(f"HRRR f{fh:02d}: missing fields")
+                P[fh] = tot[fh]
+                inc = np.clip(P[fh] - (P.get(fh - 3, 0)), 0, None)
+                S[fh] = S.get(fh - 3, 0) + inc * (frac if frac is not None else (T[fh] <= 33)) / 25.4 * 10
+            T[0] = T[3]; P[0] = np.zeros_like(P[3]); S[0] = np.zeros_like(P[3])
+            off = int(round((cyc - start).total_seconds() / 3600))
+            line = lambda d, conv: {f: (conv(d[f - off]) if (f - off) in d else None) for f in STEPS}
+            log(f"  HRRR run {cyc:%Y-%m-%d %HZ}, {off:+d} hours from the global models' run")
+            return dict(lat=lats, lon=lons, proj=proj, run=cyc, snow_note="HRRR snow from its precipitation type",
+                        T=line(T, lambda x: x), P=line(P, lambda x: x / 25.4), S=line(S, lambda x: x))
+        except Exception as e:
+            log(f"  HRRR {cyc:%HZ}: {str(e)[:160]}")
+    raise RuntimeError("no HRRR run available")
+
+def sampler(md, tlat, tlon):
+    """A function that resamples one of the model's fields to the points tlat/tlon (2-D or 1-D arrays), blending the
+    four nearest grid points; NaN outside the model's grid or where the model has no value."""
+    if md.get("proj"):
+        from pyproj import Transformer
+        tr = Transformer.from_crs("EPSG:4326", md["proj"], always_xy=True)
+        xs, _ = tr.transform(md["lon"][0, :], md["lat"][0, :]); _, ys = tr.transform(md["lon"][:, 0], md["lat"][:, 0])
+        px, py = tr.transform(tlon, tlat); colax, rowax, wx, wy = xs, ys, px, py
+    else:
+        colax, rowax, wx, wy = md["lon"][0, :], md["lat"][:, 0], tlon, tlat
+    def frac(axis, want):
+        order = np.argsort(axis); a = axis[order]
+        f = np.interp(want, a, np.arange(len(a)), left=np.nan, right=np.nan)
+        ok = ~np.isnan(f); f = np.where(ok, f, 0)
+        i0 = np.clip(np.floor(f).astype(int), 0, len(a) - 2); t = (f - i0).astype("float32")
+        return order[i0], order[i0 + 1], t, ok
+    c0, c1, tx, okx = frac(np.asarray(colax), np.asarray(wx)); r0, r1, ty, oky = frac(np.asarray(rowax), np.asarray(wy))
+    bad = ~(okx & oky)
+    def apply(a):
+        if a is None: return np.full(np.shape(wx), np.nan, dtype="float32")
+        v = (a[r0, c0] * (1 - tx) + a[r0, c1] * tx) * (1 - ty) + (a[r1, c0] * (1 - tx) + a[r1, c1] * tx) * ty
+        return np.where(bad, np.nan, v).astype("float32")
+    return apply
+
 # ---------------------------------------------------------------- city forecasts
 def nearest(md, la, lo):
     d = (md["lat"] - la) ** 2 + ((md["lon"] - lo) * math.cos(math.radians(la))) ** 2
     return np.unravel_index(np.argmin(d), d.shape)
 
 def city_series(md):
+    if md.get("proj"):  # high-detail grids: blend the nearest points; missing values become null
+        la = np.array([c["lat"] for c in CITIES]); lo = np.array([c["lon"] for c in CITIES]); smp = sampler(md, la, lo)
+        cols = {k: {f: smp(md[k][f]) for f in STEPS} for k in ("T", "P", "S")}
+        r = lambda v, n: None if v != v else round(float(v), n)
+        return {c["k"]: [[r(cols["T"][f][i], 1), r(cols["P"][f][i], 2), r(cols["S"][f][i], 1)] for f in STEPS] for i, c in enumerate(CITIES)}
     out = {}
     for c in CITIES:
         i, j = nearest(md, c["lat"], c["lon"])
@@ -324,7 +445,7 @@ def draw(models, totals, force=False):
 
 # ---------------------------------------------------------------- map grids for the website's interactive map
 # One grid for the lower 48, 0.25° wide columns, rows evenly spaced in Web Mercator (so the browser map can stretch it
-# straight onto its map), filled from each model by nearest grid point, so each model's own squares stay visible.
+# straight onto its map), filled from each model by blending its four nearest grid points.
 GRID = dict(w=-127.0, e=-65.0, s=23.0, n=51.0, cols=248, rows=144)
 def grid_axes():
     my = lambda la: math.log(math.tan(math.pi / 4 + math.radians(la) / 2))
@@ -338,18 +459,57 @@ def nearest_index(axis, want):
     i = np.clip(np.searchsorted(a, want), 1, len(a) - 1)
     i = np.where(np.abs(a[i - 1] - want) <= np.abs(a[i] - want), i - 1, i)
     return order[i]
+def encode(md, smp, shape):
+    """Each variable for every step as packed numbers: snow in tenths of an inch and rain in hundredths (uint16,
+    65535 = no forecast), temperature in °F + 80 (uint8, 0 = no forecast)."""
+    snow = np.full((len(STEPS),) + shape, 65535, dtype="<u2"); rain = snow.copy(); temp = np.zeros((len(STEPS),) + shape, dtype="u1")
+    for n, f in enumerate(STEPS):
+        for arr, k, sc in ((snow, "S", 10), (rain, "P", 100)):
+            v = smp(md[k].get(f)); arr[n] = np.where(np.isnan(v), 65535, np.clip(np.round(v * sc), 0, 65534))
+        v = smp(md["T"].get(f)); temp[n] = np.where(np.isnan(v), 0, np.clip(np.round(v) + 80, 1, 255))
+    return {"snow": snow, "rain": rain, "temp": temp}
+
 def export_grids(md, key):
     import gzip
-    lats, lons = grid_axes()
-    ri, ci = nearest_index(md["lat"][:, 0], lats), nearest_index(md["lon"][0, :], lons)
-    take = lambda a: a[np.ix_(ri, ci)]
-    snow = np.stack([np.clip(np.round(take(md["S"][f]) * 10), 0, 65535) for f in STEPS]).astype("<u2")
-    rain = np.stack([np.clip(np.round(take(md["P"][f]) * 100), 0, 65535) for f in STEPS]).astype("<u2")
-    temp = np.stack([np.clip(np.round(take(md["T"][f])) + 80, 1, 255) for f in STEPS]).astype("u1")
+    lats, lons = grid_axes(); tlon, tlat = np.meshgrid(lons, lats)
     out = {}
-    for var, arr in (("snow", snow), ("rain", rain), ("temp", temp)):
+    for var, arr in encode(md, sampler(md, tlat, tlon), tlat.shape).items():
         p = os.path.join(OUT, f"{key}-{var}.bin"); open(p, "wb").write(gzip.compress(arr.tobytes(), 6)); out[f"{key}-{var}.bin"] = p
     return out
+
+# High-detail tiles for the NWS and HRRR (about 2 miles), published with GitHub Pages: the lower 48 on a 0.03°
+# grid, rows evenly spaced in Web Mercator, cut into 256 × 256 tiles; one file per source, variable and tile, holding
+# every step. The map loads only the tiles in view once someone zooms in.
+HI = dict(w=-125.0, e=-66.5, s=24.0, n=50.0, cols=1950, tile=256)
+def hires_axes():
+    my = lambda la: math.log(math.tan(math.pi / 4 + math.radians(la) / 2))
+    y0, y1 = my(HI["n"]), my(HI["s"]); rows = int(round((y0 - y1) / math.radians((HI["e"] - HI["w"]) / HI["cols"])))
+    ys = y0 + (np.arange(rows) + 0.5) * (y1 - y0) / rows
+    lats = np.degrees(2 * np.arctan(np.exp(ys)) - math.pi / 2)
+    lons = HI["w"] + (np.arange(HI["cols"]) + 0.5) * (HI["e"] - HI["w"]) / HI["cols"]
+    return lats, lons
+
+def export_hires(sources, stamp):
+    import gzip
+    pages = os.path.join(OUT, "pages"); os.makedirs(os.path.join(pages, "hires"), exist_ok=True)
+    lats, lons = hires_axes(); rows, cols, T = len(lats), len(lons), HI["tile"]
+    tlon, tlat = np.meshgrid(lons, lats); done = []
+    for key, md in sources.items():
+        try:
+            data = encode(md, sampler(md, tlat, tlon), tlat.shape)
+            for var, arr in data.items():
+                for ty in range(0, rows, T):
+                    for tx in range(0, cols, T):
+                        part = np.ascontiguousarray(arr[:, ty:ty + T, tx:tx + T])
+                        open(os.path.join(pages, "hires", f"{key}-{var}-{tx // T}-{ty // T}.bin"), "wb").write(gzip.compress(part.tobytes(), 6))
+            done.append(key); del data
+        except Exception:
+            log(f"hires {key} failed:", traceback.format_exc()[-400:])
+    info = dict(HI, rows=rows, stamp=stamp, steps=STEPS, sources=done, runs={k: sources[k]["run"].isoformat() for k in done},
+                vars={"snow": {"type": "u16", "scale": 0.1}, "rain": {"type": "u16", "scale": 0.01}, "temp": {"type": "u8", "offset": -80}})
+    json.dump(info, open(os.path.join(pages, "hires.json"), "w"))
+    log(f"hires: {len(done)} sources, {rows} x {cols} cells, tiles in out/pages")
+    return done
 
 # ---------------------------------------------------------------- main
 def main():
@@ -368,17 +528,25 @@ def main():
     if not models:
         log("No model could be downloaded."); upload({"ok": False, "log": LOG}, None, {}); sys.exit(1)
 
+    start = max(m["run"] for m in models.values())
+    globals_ = list(models)
+    for key, fn in (("nws", nws), ("hrrr", hrrr)):  # the high-detail sources
+        try:
+            log(f"{key}: downloading"); t0 = time.time()
+            models[key] = fn(start); notes[key] = models[key]["snow_note"]; log(f"{key}: ok in {time.time() - t0:.0f}s")
+        except Exception as e:
+            log(f"{key}: skipped this time: {type(e).__name__}: {str(e)[:200]}")
     points = {k: city_series(m) for k, m in models.items()}
-    totals = {k: {c: v[I72][2] for c, v in p.items()} for k, p in points.items()}   # snow over 72 hours
+    totals = {k: {c: v[I72][2] for c, v in points[k].items()} for k in globals_}   # snow over 72 hours, global models
     big = [c for c in CITIES if c["rank"] < 200]
     storm = any(max(totals[m][c["k"]] for m in totals) >= 4 for c in big)
     log("storm:", storm, "· snowiest big cities:", sorted(((round(max(totals[m][c['k']] for m in totals), 1), c["k"]) for c in big), reverse=True)[:5])
     meta = {"ok": True, "made": dt.datetime.now(dt.timezone.utc).isoformat(), "steps": STEPS, "notes": notes,
             "runs": {k: m["run"].isoformat() for k, m in models.items()}, "storm": storm, "log": LOG[-60:]}
     files = {}
-    if (storm or force) and len(models) >= 2:
+    if (storm or force) and len(globals_) >= 2:
         try:
-            meta["map"] = draw(models, totals, force); meta["map"]["forced"] = force and not storm
+            meta["map"] = draw({k: models[k] for k in globals_}, totals, force); meta["map"]["forced"] = force and not storm
             files = {n: os.path.join(OUT, n) for n in ("map.mp4", "map.gif", "map.png")}
         except Exception:
             log("map failed:", traceback.format_exc()[-800:])
@@ -387,16 +555,21 @@ def main():
     log("map:", "drawn" if files else "not drawn", "(test map requested)" if force else "")
     # Grids for the interactive map, sent first; the meta that follows switches the site over to them.
     try:
-        stamp = max(m["run"] for m in models.values()).strftime("%Y%m%d%H")
+        stamp = start.strftime("%Y%m%d%H")
         sent = 0
         for key, md in models.items():
             for name, path in export_grids(md, key).items(): sent += upload_grid(stamp, name, path)
         meta["grid"] = dict(GRID, stamp=stamp, steps=STEPS, models=list(models), runs=meta["runs"],
                             vars={"snow": {"type": "u16", "scale": 0.1}, "rain": {"type": "u16", "scale": 0.01}, "temp": {"type": "u8", "offset": -80}})
         log(f"grids: {sent} files sent")
+        hi = export_hires({k: models[k] for k in ("nws", "hrrr") if k in models}, stamp)
+        repo = os.environ.get("GITHUB_REPOSITORY", "")
+        if hi and "/" in repo: meta["grid"]["hires"] = f"https://{repo.split('/')[0].lower()}.github.io/{repo.split('/')[1]}/hires.json"
         if sent < 3 * len(models): meta.pop("grid")
     except Exception:
         log("grids failed:", traceback.format_exc()[-600:])
+    os.makedirs(os.path.join(OUT, "pages"), exist_ok=True)  # GitHub Pages needs the folder, even if empty
+    open(os.path.join(OUT, "pages", "index.html"), "w").write("<!doctype html><title>Weather Scoreboard model data</title><p>Map data for <a href=\"https://www.weatherscoreboard.com/models/\">WeatherScoreboard.com/models</a>.</p>")
     meta["log"] = LOG[-60:]  # including the map and grid steps
     upload(meta, {"runs": meta["runs"], "steps": STEPS, "cities": points}, files)
 
