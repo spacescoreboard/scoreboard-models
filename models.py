@@ -189,9 +189,17 @@ def draw(models, totals, force=False):
     from matplotlib.patches import Polygon as MPoly
     from pyproj import Transformer
     from PIL import Image
+    # The site's fonts: from the fonts folder here, else from the plugin on the website, else a standard font.
+    fdir = os.path.join(HERE, "fonts"); os.makedirs(fdir, exist_ok=True); have = 0
+    site = os.environ.get("SITE_URL", "").rstrip("/")
     for f in ("AtkinsonHyperlegible-Regular.ttf", "AtkinsonHyperlegible-Bold.ttf", "BricolageGrotesque-ExtraBold.ttf"):
-        fm.fontManager.addfont(os.path.join(HERE, "fonts", f))
-    BODY, HEAD = "Atkinson Hyperlegible", "Bricolage Grotesque"
+        p = os.path.join(fdir, f)
+        if not os.path.exists(p) and site:
+            blob = get(site + "/wp-content/plugins/will-it-snow/assets/fonts/" + f, tries=2, ok404=True)
+            if blob and blob[:4] in (b"\x00\x01\x00\x00", b"true", b"OTTO"): open(p, "wb").write(blob)
+        if os.path.exists(p): fm.fontManager.addfont(p); have += 1
+    BODY, HEAD = ("Atkinson Hyperlegible", "Bricolage Grotesque") if have == 3 else ("DejaVu Sans", "DejaVu Sans")
+    if have < 3: log("  fonts: using DejaVu Sans (the site's fonts weren't found)")
     INK, SLATE, LINE, WATER, LAND = "#14233A", "#4A5A70", "#B9C6D3", "#DCE8F2", "#F4F6F8"
 
     # Where: around the big cities with 4+ inches in any model (or the snowiest cities when forced).
@@ -339,6 +347,10 @@ def main():
             files = {n: os.path.join(OUT, n) for n in ("map.mp4", "map.gif", "map.png")}
         except Exception:
             log("map failed:", traceback.format_exc()[-800:])
+    elif force or storm:
+        log("map: needs at least two models")
+    log("map:", "drawn" if files else "not drawn", "(test map requested)" if force else "")
+    meta["log"] = LOG[-60:]  # including the map step
     upload(meta, {"runs": meta["runs"], "steps": STEPS, "cities": points}, files)
 
 def upload(meta, points, files):
