@@ -146,10 +146,14 @@ def gem(cyc):
     def pick(pattern):
         hits = [n for n in names if n.startswith(stamp) and re.search(pattern, n)]
         return hits[0] if hits else None
-    tname, pname = pick(r"_TMP_AGL-2m_"), pick(r"_APCP_Sfc_")
+    # Environment Canada renamed its variables in 2025 (TMP → AirTemp, APCP → Precip-Accum); accept either.
+    tname = pick(r"_MSC_GDPS_AirTemp_AGL-2m_") or pick(r"_MSC_GDPS_TMP_AGL-2m_")
+    pname = pick(r"_MSC_GDPS_Precip-Accum_Sfc_") or pick(r"_MSC_GDPS_APCP_Sfc_") or pick(r"_MSC_GDPS_(?:Total)?Precip(?:itation)?-Accum[^_]*_Sfc_")
     if not tname or not pname:
-        log("  GEM file names for", stamp, "include:", sorted(set(re.sub(r"^.*_MSC_GDPS_|_LatLon.*$", "", n) for n in names))[:80])
+        vars_ = sorted(set(re.sub(r"^.*_MSC_GDPS_|_LatLon.*$", "", n) for n in names))
+        log("  GEM variables with Temp, Precip or Snow in the name:", [v for v in vars_ if re.search("Temp_AGL-2m|Precip|Snow", v)])
         raise RuntimeError("GEM temperature or precipitation file not found")
+    log("  GEM files:", re.sub(r"^.*_MSC_GDPS_|_LatLon.*$", "", tname), "and", re.sub(r"^.*_MSC_GDPS_|_LatLon.*$", "", pname))
     T, P = {}, {}; lat = lon = None
     for f in STEPS:
         if f == 0: continue
