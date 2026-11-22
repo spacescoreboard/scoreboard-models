@@ -3,8 +3,9 @@
 Twice a day (see .github/workflows/models.yml) this script:
   1. downloads the next 72 hours of three forecast models: the American GFS (NOAA), the European IFS (ECMWF open
      data) and the Canadian GDPS/GEM (Environment and Climate Change Canada);
-  2. reads each model's forecast for every Weather Scoreboard city, every 3 hours (temperature, rain and melted
-     snow, snow), which the website keeps to grade the models later;
+  2. reads each model's forecast for every Weather Scoreboard city for 7 days (temperature, rain and melted snow,
+     snow; every 3 hours, then every 6 on day 7), which the website keeps to grade the models later, and saves
+     each model's grids for the lower 48 for the website's interactive map;
   3. when a storm is coming (4 inches or more for a big city in any model), draws the animated "model fight"
      snowfall map as an MP4 video, a GIF and a still image;
   4. sends everything to the website, which checks the secret key.
@@ -23,7 +24,10 @@ import requests
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "out"); os.makedirs(OUT, exist_ok=True)
 CITIES = json.load(open(os.path.join(HERE, "cities.json")))
-STEPS = list(range(0, 73, 3))            # forecast hours used
+STEPS = list(range(0, 145, 3)) + list(range(150, 169, 6))   # forecast hours: every 3 hours to day 6, then every 6 to day 7
+PREV = {f: STEPS[i - 1] for i, f in enumerate(STEPS) if i}
+MAP_STEPS = [f for f in STEPS if f <= 72]   # the storm animation covers 3 days
+I72 = STEPS.index(72)
 REGION = dict(w=-127.0, e=-65.0, s=23.0, n=51.0)
 UA = {"User-Agent": "WeatherScoreboard models job (weatherscoreboard.com)"}
 LOG = []
@@ -97,9 +101,9 @@ def gfs(cyc):
                 if m["s0"] in tot: tot[m["s1"]] = tot[m["s0"]] + v
         if f not in tot: raise RuntimeError(f"GFS f{f:03d}: no precipitation total")
         P[f] = tot[f]
-        inc = P[f] - P[f - 3] if f - 3 in P else P[f]
+        inc = P[f] - P[PREV[f]] if PREV[f] in P else P[f]
         frac = snowfrac if snowfrac is not None else (T[f] <= 33).astype("float32")
-        S[f] = (S.get(f - 3, 0) + np.clip(inc, 0, None) * frac / 25.4 * 10)
+        S[f] = (S.get(PREV[f], 0) + np.clip(inc, 0, None) * frac / 25.4 * 10)
     T[0] = T[3]; P[0] = np.zeros_like(P[3]); S[0] = np.zeros_like(P[3])
     return dict(lat=lat, lon=lon, T=T, P={k: v / 25.4 for k, v in P.items()}, S=S, run=cyc, snow_note="GFS snow where its precipitation type is snow")
 
@@ -132,7 +136,7 @@ def ecmwf(cyc):
         S = SF
     else:
         S = {0: np.zeros_like(P[0])}
-        for f in STEPS[1:]: S[f] = S[f - 3] + np.clip(P[f] - P[f - 3], 0, None) * (T[f] <= 33) * 10
+        for f in STEPS[1:]: S[f] = S[PREV[f]] + np.clip(P[f] - P[PREV[f]], 0, None) * (T[f] <= 33) * 10
     if 0 not in P: P[0] = np.zeros_like(next(iter(P.values()))); S[0] = np.zeros_like(P[0])
     return dict(lat=lat, lon=lon, T=T, P=P, S=S, run=cyc, snow_note="ECMWF snowfall" if snow_native else "ECMWF snow from temperature")
 
@@ -165,7 +169,7 @@ def gem(cyc):
             lat, lon, v = subset(m["lats"], m["lons"], m["values"])
             store[f] = (v - 273.15) * 9 / 5 + 32 if store is T else v / 25.4   # K → °F; kg/m² (mm) → in, accumulated
     T[0] = T[3]; P[0] = np.zeros_like(P[3]); S = {0: np.zeros_like(P[3])}
-    for f in STEPS[1:]: S[f] = S[f - 3] + np.clip(P[f] - P[f - 3], 0, None) * (T[f] <= 33) * 10
+    for f in STEPS[1:]: S[f] = S[PREV[f]] + np.clip(P[f] - P[PREV[f]], 0, None) * (T[f] <= 33) * 10
     return dict(lat=lat, lon=lon, T=T, P=P, S=S, run=cyc, snow_note="GEM snow from temperature")
 
 # ---------------------------------------------------------------- city forecasts
@@ -271,7 +275,7 @@ def draw(models, totals, force=False):
         i, j = nearest(models[k], c["lat"], c["lon"]); return float(models[k]["S"][f][i, j])
 
     frames = []
-    for f in STEPS[1:]:
+    for f in MAP_STEPS[1:]:
         fig = plt.figure(figsize=(12, 5.4), dpi=100, facecolor="white")
         fig.text(0.025, 0.93, headline, fontfamily=HEAD, fontsize=21, color=INK, fontweight="heavy")
         fig.text(0.025, 0.885, f"Total snow since {clock(0)} ET", fontfamily=BODY, fontsize=12, color=SLATE)
@@ -318,6 +322,35 @@ def draw(models, totals, force=False):
     return dict(headline=headline, region=[la0, la1, lo0, lo1], cities=[c["k"] for c in CITIES if max(totals[m][c["k"]] for m in totals) >= 1],
                 show=[{"k": c["k"], "totals": {k: round(total_at(k, c, 72), 1) for k in order}} for c in show])
 
+# ---------------------------------------------------------------- map grids for the website's interactive map
+# One grid for the lower 48, 0.25° wide columns, rows evenly spaced in Web Mercator (so the browser map can stretch it
+# straight onto its map), filled from each model by nearest grid point, so each model's own squares stay visible.
+GRID = dict(w=-127.0, e=-65.0, s=23.0, n=51.0, cols=248, rows=144)
+def grid_axes():
+    my = lambda la: math.log(math.tan(math.pi / 4 + math.radians(la) / 2))
+    y0, y1 = my(GRID["n"]), my(GRID["s"])
+    ys = y0 + (np.arange(GRID["rows"]) + 0.5) * (y1 - y0) / GRID["rows"]
+    lats = np.degrees(2 * np.arctan(np.exp(ys)) - math.pi / 2)
+    lons = GRID["w"] + (np.arange(GRID["cols"]) + 0.5) * (GRID["e"] - GRID["w"]) / GRID["cols"]
+    return lats, lons
+def nearest_index(axis, want):
+    order = np.argsort(axis); a = axis[order]
+    i = np.clip(np.searchsorted(a, want), 1, len(a) - 1)
+    i = np.where(np.abs(a[i - 1] - want) <= np.abs(a[i] - want), i - 1, i)
+    return order[i]
+def export_grids(md, key):
+    import gzip
+    lats, lons = grid_axes()
+    ri, ci = nearest_index(md["lat"][:, 0], lats), nearest_index(md["lon"][0, :], lons)
+    take = lambda a: a[np.ix_(ri, ci)]
+    snow = np.stack([np.clip(np.round(take(md["S"][f]) * 10), 0, 65535) for f in STEPS]).astype("<u2")
+    rain = np.stack([np.clip(np.round(take(md["P"][f]) * 100), 0, 65535) for f in STEPS]).astype("<u2")
+    temp = np.stack([np.clip(np.round(take(md["T"][f])) + 80, 1, 255) for f in STEPS]).astype("u1")
+    out = {}
+    for var, arr in (("snow", snow), ("rain", rain), ("temp", temp)):
+        p = os.path.join(OUT, f"{key}-{var}.bin"); open(p, "wb").write(gzip.compress(arr.tobytes(), 6)); out[f"{key}-{var}.bin"] = p
+    return out
+
 # ---------------------------------------------------------------- main
 def main():
     force = os.environ.get("FORCE_MAP", "false").lower() == "true"
@@ -336,7 +369,7 @@ def main():
         log("No model could be downloaded."); upload({"ok": False, "log": LOG}, None, {}); sys.exit(1)
 
     points = {k: city_series(m) for k, m in models.items()}
-    totals = {k: {c: v[-1][2] for c, v in p.items()} for k, p in points.items()}
+    totals = {k: {c: v[I72][2] for c, v in p.items()} for k, p in points.items()}   # snow over 72 hours
     big = [c for c in CITIES if c["rank"] < 200]
     storm = any(max(totals[m][c["k"]] for m in totals) >= 4 for c in big)
     log("storm:", storm, "· snowiest big cities:", sorted(((round(max(totals[m][c['k']] for m in totals), 1), c["k"]) for c in big), reverse=True)[:5])
@@ -352,14 +385,42 @@ def main():
     elif force or storm:
         log("map: needs at least two models")
     log("map:", "drawn" if files else "not drawn", "(test map requested)" if force else "")
-    meta["log"] = LOG[-60:]  # including the map step
+    # Grids for the interactive map, sent first; the meta that follows switches the site over to them.
+    try:
+        stamp = max(m["run"] for m in models.values()).strftime("%Y%m%d%H")
+        sent = 0
+        for key, md in models.items():
+            for name, path in export_grids(md, key).items(): sent += upload_grid(stamp, name, path)
+        meta["grid"] = dict(GRID, stamp=stamp, steps=STEPS, models=list(models), runs=meta["runs"],
+                            vars={"snow": {"type": "u16", "scale": 0.1}, "rain": {"type": "u16", "scale": 0.01}, "temp": {"type": "u8", "offset": -80}})
+        log(f"grids: {sent} files sent")
+        if sent < 3 * len(models): meta.pop("grid")
+    except Exception:
+        log("grids failed:", traceback.format_exc()[-600:])
+    meta["log"] = LOG[-60:]  # including the map and grid steps
     upload(meta, {"runs": meta["runs"], "steps": STEPS, "cities": points}, files)
+
+def upload_grid(stamp, name, path):
+    url, key = os.environ.get("SITE_URL", "").rstrip("/"), os.environ.get("WIS_MODELS_KEY", "")
+    if not url or not key: return 0
+    for i in range(3):
+        try:
+            r = requests.post(url + "/wp-json/wis/v1/models/grid", headers={**UA, "X-WIS-Key": key}, data={"stamp": stamp},
+                              files={"grid": (name, open(path, "rb"), "application/octet-stream")}, timeout=120)
+            if r.status_code == 200: return 1
+            log("  grid", name, r.status_code, r.text[:160])
+        except Exception as e:
+            log("  grid", name, type(e).__name__)
+        time.sleep(5)
+    return 0
 
 def upload(meta, points, files):
     url, key = os.environ.get("SITE_URL", "").rstrip("/"), os.environ.get("WIS_MODELS_KEY", "")
     if not url or not key: log("SITE_URL or WIS_MODELS_KEY not set; nothing sent."); return
     send = {"meta": ("meta.json", json.dumps(meta), "application/json")}
-    if points: send["points"] = ("points.json", json.dumps(points, separators=(",", ":")), "application/json")
+    if points:
+        import gzip
+        send["points"] = ("points.json.gz", gzip.compress(json.dumps(points, separators=(",", ":")).encode(), 6), "application/gzip")
     for n, p in (files or {}).items(): send[n.replace(".", "_")] = (n, open(p, "rb"), "application/octet-stream")
     r = requests.post(url + "/wp-json/wis/v1/models", headers={**UA, "X-WIS-Key": key}, files=send, timeout=180)
     log("upload:", r.status_code, r.text[:300])
