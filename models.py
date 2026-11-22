@@ -252,7 +252,9 @@ def draw(models, totals, force=False):
     labels = spaced(sorted([c for c in inside if c["rank"] < 120 and visible(c)], key=lambda c: (mx(c) < 1, c["rank"])), 9, 160)
     # Totals under the maps: three well-known cities with the most snow in any model.
     show = spaced(sorted([c for c in inside if c["rank"] < 80 and mx(c) >= 1], key=lambda c: -mx(c)), 3, 250)
-    if len(show) < 3: show += [c for c in labels if c not in show][: 3 - len(show)]
+    if len(show) < 3:  # a quiet test map: the snowiest well-known cities instead of an empty city
+        more = spaced(sorted([c for c in inside if c["rank"] < 150 and c not in show], key=lambda c: -mx(c)), 3, 250)
+        show += [c for c in more if all(math.hypot((c["lat"] - o["lat"]) * 111, (c["lon"] - o["lon"]) * 85) > 250 for o in show)][: 3 - len(show)]
     show = sorted(show, key=lambda c: c["lon"])
     labels = show + [c for c in labels if c not in show and all(math.hypot((c["lat"] - o["lat"]) * 111, (c["lon"] - o["lon"]) * 85) > 160 for o in show)][: 9 - len(show)]
     spreads = [max(totals[m][c["k"]] for m in totals) - min(totals[m][c["k"]] for m in totals) for c in show]
