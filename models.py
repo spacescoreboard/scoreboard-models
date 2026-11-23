@@ -338,3 +338,369 @@ def draw(models, totals, force=False):
     fdir = os.path.join(HERE, "fonts"); os.makedirs(fdir, exist_ok=True); have = 0
     site = os.environ.get("SITE_URL", "").rstrip("/")
     for f in ("AtkinsonHyperlegible-Regular.ttf", "AtkinsonHyperlegible-Bold.ttf", "BricolageGrotesque-ExtraBold.ttf"):
+        p = os.path.join(fdir, f)
+        if not os.path.exists(p) and site:
+            blob = get(site + "/wp-content/plugins/will-it-snow/assets/fonts/" + f, tries=2, ok404=True)
+            if blob and blob[:4] in (b"\x00\x01\x00\x00", b"true", b"OTTO"): open(p, "wb").write(blob)
+        if os.path.exists(p): fm.fontManager.addfont(p); have += 1
+    BODY, HEAD = ("Atkinson Hyperlegible", "Bricolage Grotesque") if have == 3 else ("DejaVu Sans", "DejaVu Sans")
+    if have < 3: log("  fonts: using DejaVu Sans (the site's fonts weren't found)")
+    INK, SLATE, LINE, WATER, LAND = "#14233A", "#4A5A70", "#B9C6D3", "#DCE8F2", "#F4F6F8"
+
+    # Where: around the big cities with 4+ inches in any model (or the snowiest cities when forced).
+    big = [c for c in CITIES if c["rank"] < 200]
+    hit = [c for c in big if max(totals[m][c["k"]] for m in totals) >= 4] or sorted(big, key=lambda c: -max(totals[m][c["k"]] for m in totals))[:6]
+    la0, la1 = min(c["lat"] for c in hit) - 4, max(c["lat"] for c in hit) + 4
+    lo0, lo1 = min(c["lon"] for c in hit) - 7, max(c["lon"] for c in hit) + 7
+    if la1 - la0 < 12: m = (la0 + la1) / 2; la0, la1 = m - 6, m + 6
+    if lo1 - lo0 < 22: m = (lo0 + lo1) / 2; lo0, lo1 = m - 11, m + 11
+    clat, clon = (la0 + la1) / 2, (lo0 + lo1) / 2
+    proj = f"+proj=lcc +lat_1={clat-6} +lat_2={clat+6} +lat_0={clat} +lon_0={clon} +units=km"
+    tr = Transformer.from_crs("EPSG:4326", proj, always_xy=True)
+    xs, ys = tr.transform([lo0, lo1, lo0, lo1, clon, clon], [la0, la0, la1, la1, la0, la1])
+    X0, X1, Y0, Y1 = min(xs), max(xs), min(ys), max(ys)
+    # keep a 1.5 : 1 frame (panel shape)
+    w, h = X1 - X0, Y1 - Y0
+    if w / h > 1.5: d = (w / 1.5 - h) / 2; Y0, Y1 = Y0 - d, Y1 + d
+    else: d = (h * 1.5 - w) / 2; X0, X1 = X0 - d, X1 + d
+
+    ne = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/"
+    def polys(name, keep=lambda p: True):
+        data = json.loads(get(ne + name)); out = []
+        for f in data["features"]:
+            if not keep(f["properties"]): continue
+            g = f["geometry"]; parts = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+            for part in parts:
+                ring = np.array(part[0]); x, y = tr.transform(ring[:, 0], ring[:, 1])
+                if x.max() < X0 - 500 or x.min() > X1 + 500 or y.max() < Y0 - 500 or y.min() > Y1 + 500: continue
+                out.append(np.column_stack([x, y]))
+        return out
+    LANDP = polys("ne_50m_land.geojson")
+    LAKES = polys("ne_50m_lakes.geojson", lambda p: p.get("scalerank", 9) <= 2)
+    STATES = polys("ne_50m_admin_1_states_provinces_lakes.geojson", lambda p: p.get("adm0_a3") in ("USA", "CAN", "MEX"))
+
+    LEVELS = [0.1, 1, 2, 3, 4, 6, 8, 12, 18, 24, 99]
+    COLORS = ["#C6DBEF", "#9ECAE1", "#6BAED6", "#4292C6", "#2171B5", "#08519C", "#6A51A3", "#8E3FA8", "#C2378F", "#E7298A"]
+    cmap = ListedColormap(COLORS); norm = BoundaryNorm(LEVELS, cmap.N)
+    mx = lambda c: max(totals[m][c["k"]] for m in totals)
+    inside = [c for c in big if la0 <= c["lat"] <= la1 and lo0 <= c["lon"] <= lo1]
+    def visible(c):
+        x, y = tr.transform(c["lon"], c["lat"])
+        return X0 + (X1 - X0) * 0.03 < x < X1 - (X1 - X0) * 0.14 and Y0 + (Y1 - Y0) * 0.04 < y < Y1 - (Y1 - Y0) * 0.16
+    def spaced(cands, n, km):
+        out = []
+        for c in cands:
+            if all(math.hypot((c["lat"] - o["lat"]) * 111, (c["lon"] - o["lon"]) * 111 * math.cos(math.radians(c["lat"]))) > km for o in out): out.append(c)
+            if len(out) >= n: break
+        return out
+    # Labels: the biggest cities in the snow first, then other big cities, spread out and away from the edges.
+    labels = spaced(sorted([c for c in inside if c["rank"] < 120 and visible(c)], key=lambda c: (mx(c) < 1, c["rank"])), 9, 160)
+    # Totals under the maps: three well-known cities with the most snow in any model.
+    show = spaced(sorted([c for c in inside if c["rank"] < 80 and mx(c) >= 1], key=lambda c: -mx(c)), 3, 250)
+    if len(show) < 3:  # a quiet test map: the snowiest well-known cities instead of an empty city
+        more = spaced(sorted([c for c in inside if c["rank"] < 150 and c not in show], key=lambda c: -mx(c)), 3, 250)
+        show += [c for c in more if all(math.hypot((c["lat"] - o["lat"]) * 111, (c["lon"] - o["lon"]) * 85) > 250 for o in show)][: 3 - len(show)]
+    show = sorted(show, key=lambda c: c["lon"])
+    labels = show + [c for c in labels if c not in show and all(math.hypot((c["lat"] - o["lat"]) * 111, (c["lon"] - o["lon"]) * 85) > 160 for o in show)][: 9 - len(show)]
+    spreads = [max(totals[m][c["k"]] for m in totals) - min(totals[m][c["k"]] for m in totals) for c in show]
+    headline = "Snowfall forecast: the models disagree" if spreads and max(spreads) >= 4 else "Snowfall forecast: the models agree"
+    names = {"gfs": "American (GFS)", "ecmwf": "European (ECMWF)", "gem": "Canadian (GEM)"}
+    order = [k for k in ("gfs", "ecmwf", "gem") if k in models]
+    proj_grid = {k: tr.transform(models[k]["lon"], models[k]["lat"]) for k in order}
+    et = dt.timezone(dt.timedelta(hours=-5))  # Eastern Standard Time label (approximate in summer)
+    start = max(models[k]["run"] for k in order)
+    def clock(f):
+        t = (start + dt.timedelta(hours=f)).astimezone(et); hr = t.hour
+        return t.strftime("%a ") + f"{(hr % 12) or 12} {'AM' if hr < 12 else 'PM'}"
+    def total_at(k, c, f):
+        i, j = nearest(models[k], c["lat"], c["lon"]); return float(models[k]["S"][f][i, j])
+
+    frames = []
+    for f in MAP_STEPS[1:]:
+        fig = plt.figure(figsize=(12, 5.4), dpi=100, facecolor="white")
+        fig.text(0.025, 0.93, headline, fontfamily=HEAD, fontsize=21, color=INK, fontweight="heavy")
+        fig.text(0.025, 0.885, f"Total snow since {clock(0)} ET", fontfamily=BODY, fontsize=12, color=SLATE)
+        runs = " · ".join(f"{names[k].split(' ')[0]} {models[k]['run'].strftime('%HZ %b %-d')}" for k in order)
+        fig.text(0.975, 0.925, "Model runs: " + runs, fontfamily=BODY, fontsize=9.5, color=SLATE, ha="right")
+        fig.text(0.975, 0.872, clock(f) + " ET", fontfamily=HEAD, fontsize=16, fontweight="heavy", color=INK, ha="right")
+        tb = fig.add_axes([0.66, 0.862, 0.17, 0.012]); tb.set_axis_off(); tb.set_xlim(0, 72); tb.set_ylim(0, 1)
+        tb.add_patch(plt.Rectangle((0, 0), 72, 1, color="#E6EDF4")); tb.add_patch(plt.Rectangle((0, 0), f, 1, color="#2E5EAA"))
+        width = 0.975 / len(order)
+        for n, k in enumerate(order):
+            ax = fig.add_axes([0.012 + n * width, 0.17, width - 0.015, 0.66]); ax.set_xlim(X0, X1); ax.set_ylim(Y0, Y1); ax.set_axis_off()
+            ax.add_patch(plt.Rectangle((X0, Y0), X1 - X0, Y1 - Y0, color=WATER, zorder=0))
+            for pg in LANDP: ax.add_patch(MPoly(pg, closed=True, facecolor=LAND, edgecolor="none", zorder=1))
+            gx, gy = proj_grid[k]
+            ax.contourf(gx, gy, np.ma.masked_less(models[k]["S"][f], 0.1), levels=LEVELS, cmap=cmap, norm=norm, zorder=2, alpha=0.95)
+            for pg in LAKES: ax.add_patch(MPoly(pg, closed=True, facecolor=WATER, edgecolor="#9DB3C7", linewidth=0.4, zorder=3))
+            for pg in STATES: ax.add_patch(MPoly(pg, closed=True, facecolor="none", edgecolor=LINE, linewidth=0.45, zorder=4))
+            ax.add_patch(plt.Rectangle((X0, Y0), X1 - X0, Y1 - Y0, fill=False, edgecolor="#D3DEE9", linewidth=1, zorder=6))
+            for c in labels:
+                x, y = tr.transform(c["lon"], c["lat"]); ax.plot(x, y, "o", ms=3.2, color=INK, zorder=5)
+                ax.text(x + (X1 - X0) * 0.012, y + (Y1 - Y0) * 0.015, c["name"], fontsize=8, fontfamily=BODY, color=INK, zorder=5, clip_on=True)
+            ax.text(X0 + (X1 - X0) * 0.02, Y1 - (Y1 - Y0) * 0.08, names[k], fontfamily=HEAD, fontsize=13, fontweight="heavy", color=INK, zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="#D3DEE9"))
+            tot = "   ".join(f"{c['name']}: {total_at(k, c, f):.0f} in" for c in show)
+            fig.text(0.012 + n * width + (width - 0.015) / 2, 0.135, tot, fontfamily=BODY, fontsize=9.5, color=INK, ha="center")
+        lx = fig.add_axes([0.25, 0.06, 0.5, 0.028]); lx.set_axis_off()
+        for i, col in enumerate(COLORS): lx.add_patch(plt.Rectangle((i, 0), 1, 1, color=col))
+        lx.set_xlim(0, len(COLORS)); lx.set_ylim(0, 1)
+        for i, v in enumerate(LEVELS[:-1]):
+            fig.text(0.25 + 0.5 * i / len(COLORS), 0.035, "0.1" if v == 0.1 else str(v), fontsize=8.5, fontfamily=BODY, color=SLATE, ha="center")
+        fig.text(0.755, 0.064, "inches of snow (10:1)", fontsize=9, fontfamily=BODY, color=SLATE)
+        fig.text(0.025, 0.02, "WeatherScoreboard.com", fontfamily=HEAD, fontsize=11, fontweight="heavy", color=INK)
+        fig.text(0.975, 0.02, "Data: NOAA GFS · © ECMWF, CC BY 4.0 · Environment and Climate Change Canada · snow totals by Weather Scoreboard", fontfamily=BODY, fontsize=8.5, color=SLATE, ha="right")
+        fig.canvas.draw(); im = Image.frombuffer("RGBA", fig.canvas.get_width_height(), fig.canvas.buffer_rgba()).convert("RGB")
+        im.save(os.path.join(OUT, f"frame{len(frames):03d}.png")); frames.append(im); plt.close(fig)
+
+    frames[-1].save(os.path.join(OUT, "map.png"))
+    pal = frames[-1].quantize(colors=128, method=Image.Quantize.MEDIANCUT)
+    q = [fr.quantize(palette=pal, dither=Image.Dither.NONE) for fr in frames]
+    q[0].save(os.path.join(OUT, "map.gif"), save_all=True, append_images=q[1:], duration=[260] * (len(q) - 1) + [2600], loop=0, optimize=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", "4", "-i", os.path.join(OUT, "frame%03d.png"),
+                    "-vf", "tpad=stop_mode=clone:stop_duration=2.5,scale=1200:-2,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast",
+                    "-crf", "20", "-movflags", "+faststart", os.path.join(OUT, "map.mp4")], check=True)
+    return dict(headline=headline, region=[la0, la1, lo0, lo1], cities=[c["k"] for c in CITIES if max(totals[m][c["k"]] for m in totals) >= 1],
+                show=[{"k": c["k"], "totals": {k: round(total_at(k, c, 72), 1) for k in order}} for c in show])
+
+# ---------------------------------------------------------------- map grids for the website's interactive map
+# One grid for the lower 48, 0.25° wide columns, rows evenly spaced in Web Mercator (so the browser map can stretch it
+# straight onto its map), filled from each model by blending its four nearest grid points.
+GRID = dict(w=-127.0, e=-65.0, s=23.0, n=51.0, cols=248, rows=144)
+def grid_axes():
+    my = lambda la: math.log(math.tan(math.pi / 4 + math.radians(la) / 2))
+    y0, y1 = my(GRID["n"]), my(GRID["s"])
+    ys = y0 + (np.arange(GRID["rows"]) + 0.5) * (y1 - y0) / GRID["rows"]
+    lats = np.degrees(2 * np.arctan(np.exp(ys)) - math.pi / 2)
+    lons = GRID["w"] + (np.arange(GRID["cols"]) + 0.5) * (GRID["e"] - GRID["w"]) / GRID["cols"]
+    return lats, lons
+def nearest_index(axis, want):
+    order = np.argsort(axis); a = axis[order]
+    i = np.clip(np.searchsorted(a, want), 1, len(a) - 1)
+    i = np.where(np.abs(a[i - 1] - want) <= np.abs(a[i] - want), i - 1, i)
+    return order[i]
+def encode(md, smp, shape):
+    """Each variable for every step as packed numbers: snow in tenths of an inch and rain in hundredths (uint16,
+    65535 = no forecast), temperature in °F + 80 (uint8, 0 = no forecast)."""
+    snow = np.full((len(STEPS),) + shape, 65535, dtype="<u2"); rain = snow.copy(); temp = np.zeros((len(STEPS),) + shape, dtype="u1")
+    for n, f in enumerate(STEPS):
+        for arr, k, sc in ((snow, "S", 10), (rain, "P", 100)):
+            v = smp(md[k].get(f)); arr[n] = np.where(np.isnan(v), 65535, np.clip(np.round(v * sc), 0, 65534))
+        v = smp(md["T"].get(f)); temp[n] = np.where(np.isnan(v), 0, np.clip(np.round(v) + 80, 1, 255))
+    return {"snow": snow, "rain": rain, "temp": temp}
+
+def export_grids(md, key):
+    import gzip
+    lats, lons = grid_axes(); tlon, tlat = np.meshgrid(lons, lats)
+    out = {}
+    for var, arr in encode(md, sampler(md, tlat, tlon), tlat.shape).items():
+        p = os.path.join(OUT, f"{key}-{var}.bin"); open(p, "wb").write(gzip.compress(arr.tobytes(), 6)); out[f"{key}-{var}.bin"] = p
+    return out
+
+# High-detail tiles for the NWS and HRRR (about 2 miles), published with GitHub Pages: the lower 48 on a 0.03°
+# grid, rows evenly spaced in Web Mercator, cut into 256 × 256 tiles; one file per source, variable and tile, holding
+# every step. The map loads only the tiles in view once someone zooms in.
+HI = dict(w=-125.0, e=-66.5, s=24.0, n=50.0, cols=1950, tile=256)
+def hires_axes():
+    my = lambda la: math.log(math.tan(math.pi / 4 + math.radians(la) / 2))
+    y0, y1 = my(HI["n"]), my(HI["s"]); rows = int(round((y0 - y1) / math.radians((HI["e"] - HI["w"]) / HI["cols"])))
+    ys = y0 + (np.arange(rows) + 0.5) * (y1 - y0) / rows
+    lats = np.degrees(2 * np.arctan(np.exp(ys)) - math.pi / 2)
+    lons = HI["w"] + (np.arange(HI["cols"]) + 0.5) * (HI["e"] - HI["w"]) / HI["cols"]
+    return lats, lons
+
+def export_hires(sources, stamp):
+    import gzip
+    pages = os.path.join(OUT, "pages"); os.makedirs(os.path.join(pages, "hires"), exist_ok=True)
+    lats, lons = hires_axes(); rows, cols, T = len(lats), len(lons), HI["tile"]
+    tlon, tlat = np.meshgrid(lons, lats); done = []
+    for key, md in sources.items():
+        try:
+            data = encode(md, sampler(md, tlat, tlon), tlat.shape)
+            for var, arr in data.items():
+                for ty in range(0, rows, T):
+                    for tx in range(0, cols, T):
+                        part = np.ascontiguousarray(arr[:, ty:ty + T, tx:tx + T])
+                        open(os.path.join(pages, "hires", f"{key}-{var}-{tx // T}-{ty // T}.bin"), "wb").write(gzip.compress(part.tobytes(), 6))
+            done.append(key); del data
+        except Exception:
+            log(f"hires {key} failed:", traceback.format_exc()[-400:])
+    info = dict(HI, rows=rows, stamp=stamp, steps=STEPS, sources=done, runs={k: sources[k]["run"].isoformat() for k in done},
+                vars={"snow": {"type": "u16", "scale": 0.1}, "rain": {"type": "u16", "scale": 0.01}, "temp": {"type": "u8", "offset": -80}})
+    json.dump(info, open(os.path.join(pages, "hires.json"), "w"))
+    log(f"hires: {len(done)} sources, {rows} x {cols} cells, tiles in out/pages")
+    return done
+
+# ---------------------------------------------------------------- the homepage picture (Model Watch)
+PREVIEW_SCALES = {
+    "snow": ([0.1, 1, 2, 3, 4, 6, 8, 12, 18, 24, 999], ["#C6DBEF", "#9ECAE1", "#6BAED6", "#4292C6", "#2171B5", "#08519C", "#6A51A3", "#8E3FA8", "#C2378F", "#E7298A"], ["0.1", "1", "2", "3", "4", "6", "8", "12", "18", "24+"]),
+    "rain": ([0.01, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 999], ["#D9F0D3", "#ADDDA3", "#78C679", "#41AB5D", "#238443", "#1D91C0", "#225EA8", "#253494", "#7A3E9D", "#B0358B", "#E0218A"], ["0.01", "0.1", "¼", "½", "¾", "1", "1½", "2", "3", "4", "6+"]),
+}
+def preview(models, var):
+    """One still picture for the homepage: one model's total snow (or rain, on a week without snow) over the next
+    7 days across the lower 48, the same colors as the interactive map. Saved as out/preview.jpg."""
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patheffects as pe
+    from matplotlib import font_manager as fm
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    from matplotlib.patches import Polygon as MPoly
+    from pyproj import Transformer
+    from PIL import Image
+    pick = next(k for k in ("ecmwf", "gfs", "gem") if k in models); md = models[pick]; last = STEPS[-1]
+    fdir = os.path.join(HERE, "fonts"); os.makedirs(fdir, exist_ok=True); body = "DejaVu Sans"; site = os.environ.get("SITE_URL", "").rstrip("/")
+    for f in ("AtkinsonHyperlegible-Regular.ttf", "AtkinsonHyperlegible-Bold.ttf"):  # the site's font, as for the storm map
+        path = os.path.join(fdir, f)
+        if not os.path.exists(path) and site:
+            blob = get(site + "/wp-content/plugins/will-it-snow/assets/fonts/" + f, tries=2, ok404=True)
+            if blob and blob[:4] in (b"\x00\x01\x00\x00", b"true", b"OTTO"): open(path, "wb").write(blob)
+        if os.path.exists(path): fm.fontManager.addfont(path); body = "Atkinson Hyperlegible"
+    tr = Transformer.from_crs("EPSG:4326", "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=38 +lon_0=-96 +units=km", always_xy=True)
+    lats = np.linspace(20, 54, 340); lons = np.linspace(-130, -60, 700); tlon, tlat = np.meshgrid(lons, lats)
+    vals = sampler(md, tlat, tlon)((md["S"] if var == "snow" else md["P"]).get(last))
+    X, Y = tr.transform(tlon, tlat)
+    levels, colors, labels = PREVIEW_SCALES[var]
+    W, H = 1200, 680; X0, X1, Y0, Y1 = -2450, 2350, -1500, 1250
+    if (X1 - X0) / (Y1 - Y0) > W / H: d = ((X1 - X0) * H / W - (Y1 - Y0)) / 2; Y0, Y1 = Y0 - d, Y1 + d
+    else: d = ((Y1 - Y0) * W / H - (X1 - X0)) / 2; X0, X1 = X0 - d, X1 + d
+    fig = plt.figure(figsize=(W / 100, H / 100), dpi=100); ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(X0, X1); ax.set_ylim(Y0, Y1); ax.axis("off")
+    fig.patch.set_facecolor("#DCE8F2")
+    ne = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/"
+    def polys(name, keep=lambda p: True):
+        raw = get(ne + name); out = []
+        if not raw: return out
+        for f in json.loads(raw)["features"]:
+            if not keep(f["properties"]): continue
+            g = f["geometry"]; parts = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+            for part in parts:
+                ring = np.array(part[0]); x, y = tr.transform(ring[:, 0], ring[:, 1])
+                if x.max() < X0 - 300 or x.min() > X1 + 300 or y.max() < Y0 - 300 or y.min() > Y1 + 300: continue
+                out.append(np.column_stack([x, y]))
+        return out
+    for poly in polys("ne_50m_land.geojson"): ax.add_patch(MPoly(poly, closed=True, facecolor="#F4F6F8", edgecolor="none", zorder=1))
+    masked = np.ma.masked_where(~np.isfinite(vals) | (vals < levels[0]), vals)
+    if masked.count(): ax.contourf(X, Y, masked, levels=levels, cmap=ListedColormap(colors), norm=BoundaryNorm(levels, len(colors)), zorder=2, alpha=0.92)
+    for poly in polys("ne_50m_lakes.geojson", lambda p: p.get("scalerank", 9) <= 2): ax.add_patch(MPoly(poly, closed=True, facecolor="#DCE8F2", edgecolor="#9FB0C2", linewidth=0.5, zorder=3))
+    for poly in polys("ne_50m_admin_1_states_provinces_lakes.geojson", lambda p: p.get("adm0_a3") in ("USA", "CAN", "MEX")):
+        ax.add_patch(MPoly(poly, closed=True, facecolor="none", edgecolor="#8A9AAE", linewidth=0.6, zorder=4))
+    halo = [pe.withStroke(linewidth=3, foreground="white")]
+    show = ("Seattle", "San Francisco", "Los Angeles", "Phoenix", "Salt Lake City", "Denver", "Dallas", "Houston", "Minneapolis", "Kansas City",
+            "Chicago", "St. Louis", "Detroit", "Nashville", "Atlanta", "Washington", "New York", "Boston")
+    seen = set()
+    for c in sorted([c for c in CITIES if c["name"] in show], key=lambda c: c["rank"]):
+        if c["name"] in seen: continue  # Kansas City, MO and KS: one label
+        seen.add(c["name"])
+        x, y = tr.transform(c["lon"], c["lat"])
+        if not (X0 + 60 < x < X1 - 260 and Y0 + 120 < y < Y1 - 60): continue
+        ax.plot(x, y, "o", ms=3.5, color="#14233A", zorder=6)
+        ax.text(x + 22, y + 10, c["name"], fontsize=11, family=body, color="#14233A", zorder=6, path_effects=halo)
+    # Legend, bottom right
+    lx, ly, lw, lh = X1 - (X1 - X0) * 0.36, Y0 + (Y1 - Y0) * 0.05, (X1 - X0) * 0.33, (Y1 - Y0) * 0.022
+    n = len(colors); ax.add_patch(plt.Rectangle((lx - 25, ly - lh * 2.6), lw + 50, lh * 5.2, facecolor="white", edgecolor="#D3DEE9", zorder=7))
+    for i, col in enumerate(colors): ax.add_patch(plt.Rectangle((lx + lw * i / n, ly), lw / n, lh, facecolor=col, edgecolor="none", zorder=8))
+    for i, lab in enumerate(labels):
+        if i % 2 and n > 10: continue
+        ax.text(lx + lw * i / n, ly - lh * 0.4, lab, fontsize=9, family=body, color="#33445B", va="top", ha="left", zorder=8)
+    ax.text(lx + lw, ly + lh * 1.5, "inches", fontsize=9, family=body, color="#33445B", ha="right", va="bottom", zorder=8)
+    png = os.path.join(OUT, "preview.png"); fig.savefig(png, dpi=100, facecolor=fig.get_facecolor()); plt.close(fig)
+    jpg = os.path.join(OUT, "preview.jpg"); Image.open(png).convert("RGB").save(jpg, "JPEG", quality=84, optimize=True, progressive=True)
+    log(f"preview: {pick} {var}, {os.path.getsize(jpg) // 1024} KB")
+    return dict(model=pick, var=var, hours=last)
+
+# ---------------------------------------------------------------- main
+def main():
+    force = os.environ.get("FORCE_MAP", "false").lower() == "true"
+    models, notes = {}, {}
+    for key, fn in (("gfs", gfs), ("ecmwf", ecmwf), ("gem", gem)):
+        for cyc in cycle_candidates():
+            try:
+                log(f"{key}: trying the {cyc:%Y-%m-%d %HZ} run"); t0 = time.time()
+                models[key] = fn(cyc); notes[key] = models[key]["snow_note"]
+                log(f"{key}: ok in {time.time() - t0:.0f}s"); break
+            except Exception as e:
+                log(f"{key}: {type(e).__name__}: {str(e)[:200]}")
+        else:
+            log(f"{key}: skipped this time")
+    if not models:
+        log("No model could be downloaded."); upload({"ok": False, "log": LOG}, None, {}); sys.exit(1)
+
+    start = max(m["run"] for m in models.values())
+    globals_ = list(models)
+    for key, fn in (("nws", nws), ("hrrr", hrrr)):  # the high-detail sources
+        try:
+            log(f"{key}: downloading"); t0 = time.time()
+            models[key] = fn(start); notes[key] = models[key]["snow_note"]; log(f"{key}: ok in {time.time() - t0:.0f}s")
+        except Exception as e:
+            log(f"{key}: skipped this time: {type(e).__name__}: {str(e)[:200]}")
+    points = {k: city_series(m) for k, m in models.items()}
+    totals = {k: {c: v[I72][2] for c, v in points[k].items()} for k in globals_}   # snow over 72 hours, global models
+    big = [c for c in CITIES if c["rank"] < 200]
+    storm = any(max(totals[m][c["k"]] for m in totals) >= 4 for c in big)
+    log("storm:", storm, "· snowiest big cities:", sorted(((round(max(totals[m][c['k']] for m in totals), 1), c["k"]) for c in big), reverse=True)[:5])
+    meta = {"ok": True, "made": dt.datetime.now(dt.timezone.utc).isoformat(), "steps": STEPS, "notes": notes,
+            "runs": {k: m["run"].isoformat() for k, m in models.items()}, "storm": storm, "log": LOG[-60:]}
+    files = {}
+    if (storm or force) and len(globals_) >= 2:
+        try:
+            meta["map"] = draw({k: models[k] for k in globals_}, totals, force); meta["map"]["forced"] = force and not storm
+            files = {n: os.path.join(OUT, n) for n in ("map.mp4", "map.gif", "map.png")}
+        except Exception:
+            log("map failed:", traceback.format_exc()[-800:])
+    elif force or storm:
+        log("map: needs at least two models")
+    log("map:", "drawn" if files else "not drawn", "(test map requested)" if force else "")
+    # The homepage picture, every run: 7-day snow if any big city gets an inch in any global model, else rain.
+    try:
+        week = max((v[-1][2] or 0) for k in globals_ for c, v in points[k].items() if c in {x["k"] for x in big} and v and v[-1][2] is not None)
+        meta["preview"] = preview({k: models[k] for k in globals_}, "snow" if week >= 1 else "rain")
+        files["preview.jpg"] = os.path.join(OUT, "preview.jpg")
+    except Exception:
+        log("preview failed:", traceback.format_exc()[-600:])
+    # Grids for the interactive map, sent first; the meta that follows switches the site over to them.
+    try:
+        stamp = start.strftime("%Y%m%d%H")
+        sent = 0
+        for key, md in models.items():
+            for name, path in export_grids(md, key).items(): sent += upload_grid(stamp, name, path)
+        meta["grid"] = dict(GRID, stamp=stamp, steps=STEPS, models=list(models), runs=meta["runs"],
+                            vars={"snow": {"type": "u16", "scale": 0.1}, "rain": {"type": "u16", "scale": 0.01}, "temp": {"type": "u8", "offset": -80}})
+        log(f"grids: {sent} files sent")
+        hi = export_hires({k: models[k] for k in ("nws", "hrrr") if k in models}, stamp)
+        repo = os.environ.get("GITHUB_REPOSITORY", "")
+        if hi and "/" in repo: meta["grid"]["hires"] = f"https://{repo.split('/')[0].lower()}.github.io/{repo.split('/')[1]}/hires.json"
+        if sent < 3 * len(models): meta.pop("grid")
+    except Exception:
+        log("grids failed:", traceback.format_exc()[-600:])
+    os.makedirs(os.path.join(OUT, "pages"), exist_ok=True)  # GitHub Pages needs the folder, even if empty
+    open(os.path.join(OUT, "pages", "index.html"), "w").write("<!doctype html><title>Weather Scoreboard model data</title><p>Map data for <a href=\"https://www.weatherscoreboard.com/models/\">WeatherScoreboard.com/models</a>.</p>")
+    meta["log"] = LOG[-60:]  # including the map and grid steps
+    upload(meta, {"runs": meta["runs"], "steps": STEPS, "cities": points}, files)
+
+def upload_grid(stamp, name, path):
+    url, key = os.environ.get("SITE_URL", "").rstrip("/"), os.environ.get("WIS_MODELS_KEY", "")
+    if not url or not key: return 0
+    for i in range(3):
+        try:
+            r = requests.post(url + "/wp-json/wis/v1/models/grid", headers={**UA, "X-WIS-Key": key}, data={"stamp": stamp},
+                              files={"grid": (name, open(path, "rb"), "application/octet-stream")}, timeout=120)
+            if r.status_code == 200: return 1
+            log("  grid", name, r.status_code, r.text[:160])
+        except Exception as e:
+            log("  grid", name, type(e).__name__)
+        time.sleep(5)
+    return 0
+
+def upload(meta, points, files):
+    url, key = os.environ.get("SITE_URL", "").rstrip("/"), os.environ.get("WIS_MODELS_KEY", "")
+    if not url or not key: log("SITE_URL or WIS_MODELS_KEY not set; nothing sent."); return
+    send = {"meta": ("meta.json", json.dumps(meta), "application/json")}
+    if points:
+        import gzip
+        send["points"] = ("points.json.gz", gzip.compress(json.dumps(points, separators=(",", ":")).encode(), 6), "application/gzip")
+    for n, p in (files or {}).items(): send[n.replace(".", "_")] = (n, open(p, "rb"), "application/octet-stream")
+    r = requests.post(url + "/wp-json/wis/v1/models", headers={**UA, "X-WIS-Key": key}, files=send, timeout=180)
+    log("upload:", r.status_code, r.text[:300])
+    if r.status_code != 200: sys.exit(1)
+
+if __name__ == "__main__":
+    main()
