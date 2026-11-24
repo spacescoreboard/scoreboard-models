@@ -104,9 +104,10 @@ def step_hours(v):
     else: h = int(float(t))
     return int(h) if h == int(h) else h
 
-def cycle_candidates():
-    """Most recent 00/12 UTC runs, newest first, allowing about 5 hours for a run to be published."""
-    now = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=5)
+def cycle_candidates(lag=5):
+    """Most recent 00/12 UTC runs, newest first, allowing `lag` hours for a run to be published (the European's open
+    data comes out about 7 to 8 hours after its start time, the others about 4 to 5)."""
+    now = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=lag)
     c = now.replace(minute=0, second=0, microsecond=0, hour=0 if now.hour < 12 else 12)
     return [c, c - dt.timedelta(hours=12), c - dt.timedelta(hours=24)]
 
@@ -182,6 +183,8 @@ def ecmwf(cyc):
         except Exception as e:
             log("  ECMWF source", src, "failed:", type(e).__name__, str(e)[:160])
             if DEADLINE and time.time() > DEADLINE - 30: raise OutOfTime("ECMWF out of time")
+            # Not on ECMWF's own server yet: the cloud copies come later still, so go straight to the run before.
+            if src == "ecmwf" and "404" in str(e): raise RuntimeError("this ECMWF run isn't published yet")
     else:
         raise RuntimeError("ECMWF not available")
     msgs = grib_fields(open(target, "rb").read())
@@ -696,7 +699,7 @@ def main():
     for key, fn in (("gfs", gfs), ("ecmwf", ecmwf), ("gem", gem)):
         if not budget(15):
             log(f"{key}: skipped, out of time"); continue
-        for cyc in cycle_candidates():
+        for cyc in cycle_candidates(8 if key == "ecmwf" else 5):
             try:
                 log(f"{key}: trying the {cyc:%Y-%m-%d %HZ} run"); t0 = time.time()
                 models[key] = fn(cyc); notes[key] = models[key]["snow_note"]
