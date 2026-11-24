@@ -35,15 +35,35 @@ LOG = []
 def log(*a):
     m = " ".join(str(x) for x in a); print(m, flush=True); LOG.append(m)
 
+# Time budgets. A slow or stuck data server used to hold the whole job until GitHub stopped it at 75 minutes, and then
+# nothing reached the site. Now each source gets its own share of time (DEADLINE, set in main), each download its own
+# limit for the whole file (not just between bytes), and the job sends whatever it has by about 55 minutes.
+JOB_START = time.time()
+JOB_LIMIT = 55 * 60
+DEADLINE = None
+
+class OutOfTime(Exception):
+    pass
+
 def get(url, tries=4, timeout=120, ok404=False):
     for i in range(tries):
+        if DEADLINE and time.time() > DEADLINE:
+            raise OutOfTime("this source's time is up")
         try:
-            r = requests.get(url, headers=UA, timeout=timeout)
-            if r.status_code == 200: return r.content
+            t0 = time.time(); r = requests.get(url, headers=UA, timeout=min(timeout, 60), stream=True)
+            if r.status_code == 200:
+                buf = bytearray()
+                for chunk in r.iter_content(1 << 14):
+                    buf += chunk
+                    if time.time() - t0 > timeout * 2 or (DEADLINE and time.time() > DEADLINE):
+                        r.close(); raise TimeoutError(f"download too slow ({len(buf) // 1024} KB in {time.time() - t0:.0f}s)")
+                return bytes(buf)
             if r.status_code == 404 and ok404: return None
             log("  HTTP", r.status_code, url[:140])
+        except OutOfTime:
+            raise
         except Exception as e:
-            log("  error", type(e).__name__, url[:140])
+            log("  error", type(e).__name__, str(e)[:80], url[:140])
         time.sleep(5 * (i + 1))
     return None
 
@@ -116,14 +136,15 @@ def ecmwf(cyc):
         try:
             c = Client(source=src)
             try:
-                c.retrieve(date=cyc.strftime("%Y%m%d"), time=cyc.hour, type="fc", step=STEPS, param=["2t", "tp", "sf"], target=target)
+                limited(left(600), c.retrieve, date=cyc.strftime("%Y%m%d"), time=cyc.hour, type="fc", step=STEPS, param=["2t", "tp", "sf"], target=target)
             except Exception as e:
                 log("  ECMWF snowfall not available (", type(e).__name__, "); using temperature")
                 snow_native = False
-                c.retrieve(date=cyc.strftime("%Y%m%d"), time=cyc.hour, type="fc", step=STEPS, param=["2t", "tp"], target=target)
+                limited(left(600), c.retrieve, date=cyc.strftime("%Y%m%d"), time=cyc.hour, type="fc", step=STEPS, param=["2t", "tp"], target=target)
             break
         except Exception as e:
             log("  ECMWF source", src, "failed:", type(e).__name__, str(e)[:160])
+            if DEADLINE and time.time() > DEADLINE - 30: raise OutOfTime("ECMWF out of time")
     else:
         raise RuntimeError("ECMWF not available")
     msgs = grib_fields(open(target, "rb").read())
@@ -608,30 +629,62 @@ def preview(models, var):
     return dict(model=pick, var=var, hours=last)
 
 # ---------------------------------------------------------------- main
+def limited(seconds, fn, *a, **k):
+    """Run fn in a child process and stop it after `seconds` (the ECMWF client downloads on its own, not through get())."""
+    import multiprocessing as mp
+    ctx = mp.get_context("fork"); q = ctx.Queue()
+    def run():
+        try: fn(*a, **k); q.put("")
+        except Exception as e: q.put(f"{type(e).__name__}: {str(e)[:150]}")
+    p = ctx.Process(target=run); p.start(); p.join(max(30, seconds))
+    if p.is_alive():
+        p.terminate(); p.join(5); raise TimeoutError(f"no complete download in {max(30, seconds):.0f}s")
+    err = q.get() if not q.empty() else "the download stopped"
+    if err: raise RuntimeError(err)
+
+def left(cap):
+    """Seconds this source may still use, at most `cap`."""
+    return min(cap, (DEADLINE - time.time()) if DEADLINE else cap)
+
+def budget(minutes):
+    """Start a source's time: its own minutes, but never past the job's limit."""
+    global DEADLINE
+    DEADLINE = min(time.time() + minutes * 60, JOB_START + JOB_LIMIT)
+    return DEADLINE > time.time() + 30
+
 def main():
+    global DEADLINE
     force = os.environ.get("FORCE_MAP", "false").lower() == "true"
     models, notes = {}, {}
     for key, fn in (("gfs", gfs), ("ecmwf", ecmwf), ("gem", gem)):
+        if not budget(15):
+            log(f"{key}: skipped, out of time"); continue
         for cyc in cycle_candidates():
             try:
                 log(f"{key}: trying the {cyc:%Y-%m-%d %HZ} run"); t0 = time.time()
                 models[key] = fn(cyc); notes[key] = models[key]["snow_note"]
                 log(f"{key}: ok in {time.time() - t0:.0f}s"); break
+            except OutOfTime:
+                log(f"{key}: out of time after {time.time() - t0:.0f}s, skipped this time"); break
             except Exception as e:
                 log(f"{key}: {type(e).__name__}: {str(e)[:200]}")
         else:
             log(f"{key}: skipped this time")
+    DEADLINE = None
     if not models:
         log("No model could be downloaded."); upload({"ok": False, "log": LOG}, None, {}); sys.exit(1)
 
     start = max(m["run"] for m in models.values())
     globals_ = list(models)
     for key, fn in (("nws", nws), ("hrrr", hrrr)):  # the high-detail sources
+        if not budget(8):
+            log(f"{key}: skipped, out of time"); continue
         try:
             log(f"{key}: downloading"); t0 = time.time()
             models[key] = fn(start); notes[key] = models[key]["snow_note"]; log(f"{key}: ok in {time.time() - t0:.0f}s")
         except Exception as e:
             log(f"{key}: skipped this time: {type(e).__name__}: {str(e)[:200]}")
+    DEADLINE = None
     points = {k: city_series(m) for k, m in models.items()}
     totals = {k: {c: v[I72][2] for c, v in points[k].items()} for k in globals_}   # snow over 72 hours, global models
     big = [c for c in CITIES if c["rank"] < 200]
