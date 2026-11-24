@@ -45,6 +45,23 @@ DEADLINE = None
 class OutOfTime(Exception):
     pass
 
+# Whether the website answers GitHub at all (checked once at the start). When it doesn't, the job skips everything that
+# talks to the site (its fonts, the pushes) instead of waiting minutes on each, and the site collects this run from
+# GitHub Pages instead (out/pages/delivery, fetched by the plugin's server task).
+SITE_OK = None
+def site_ok():
+    global SITE_OK
+    if SITE_OK is None:
+        url = os.environ.get("SITE_URL", "").rstrip("/")
+        try:
+            r = requests.get(url + "/wp-json/wis/v1", headers=UA, timeout=(15, 30)) if url else None
+            SITE_OK = bool(r is not None and r.status_code == 200 and "wis\\/v1" in r.text[:5000])
+            if r is not None and not SITE_OK: log("  the website answered", r.status_code, "instead of its models address")
+        except Exception as e:
+            log("  the website didn't answer from GitHub:", type(e).__name__); SITE_OK = False
+        if url and not SITE_OK: log("  sending this run through GitHub Pages only; the site picks it up from there")
+    return SITE_OK
+
 def get(url, tries=4, timeout=120, ok404=False):
     for i in range(tries):
         if DEADLINE and time.time() > DEADLINE:
@@ -66,6 +83,14 @@ def get(url, tries=4, timeout=120, ok404=False):
             log("  error", type(e).__name__, str(e)[:80], url[:140])
         time.sleep(5 * (i + 1))
     return None
+
+def step_hours(v):
+    """A GRIB step as hours: 6, "6", "6h" or "30m" (the NWS grids sometimes count in minutes)."""
+    t = str(v).strip().lower()
+    if t.endswith("m"): h = int(t[:-1]) / 60
+    elif t.endswith("h"): h = int(t[:-1])
+    else: h = int(float(t))
+    return int(h) if h == int(h) else h
 
 def cycle_candidates():
     """Most recent 00/12 UTC runs, newest first, allowing about 5 hours for a run to be published."""
@@ -93,8 +118,8 @@ def grib_fields(blob):
     with pygrib.open(path) as g:
         for m in g:
             lats, lons = m.latlons()
-            try: s0, s1 = int(m.startStep), int(m.endStep)
-            except Exception: s0 = s1 = int(getattr(m, "step", 0))
+            try: s0, s1 = step_hours(m.startStep), step_hours(m.endStep)
+            except Exception: s0 = s1 = step_hours(getattr(m, "step", 0))
             out.append(dict(name=m.shortName, s0=s0, s1=s1, values=np.array(m.values, dtype="float32"), lats=lats, lons=lons))
     return out
 
@@ -226,8 +251,8 @@ def grib_proj(blob):
     with pygrib.open(path) as g:
         for m in g:
             if lats is None: lats, lons = m.latlons(); proj = m.projparams
-            try: s0, s1 = int(m.startStep), int(m.endStep)
-            except Exception: s0 = s1 = int(getattr(m, "step", 0))
+            try: s0, s1 = step_hours(m.startStep), step_hours(m.endStep)
+            except Exception: s0 = s1 = step_hours(getattr(m, "step", 0))
             ana = m.analDate.replace(tzinfo=dt.timezone.utc)
             out.append(dict(name=m.shortName, s0=s0, s1=s1, t0=ana + dt.timedelta(hours=s0), t1=ana + dt.timedelta(hours=s1),
                             values=np.array(np.ma.filled(m.values.astype("float32"), np.nan))))
@@ -360,8 +385,8 @@ def draw(models, totals, force=False):
     site = os.environ.get("SITE_URL", "").rstrip("/")
     for f in ("AtkinsonHyperlegible-Regular.ttf", "AtkinsonHyperlegible-Bold.ttf", "BricolageGrotesque-ExtraBold.ttf"):
         p = os.path.join(fdir, f)
-        if not os.path.exists(p) and site:
-            blob = get(site + "/wp-content/plugins/will-it-snow/assets/fonts/" + f, tries=2, ok404=True)
+        if not os.path.exists(p) and site and site_ok():
+            blob = get(site + "/wp-content/plugins/will-it-snow/assets/fonts/" + f, tries=2, timeout=30, ok404=True)
             if blob and blob[:4] in (b"\x00\x01\x00\x00", b"true", b"OTTO"): open(p, "wb").write(blob)
         if os.path.exists(p): fm.fontManager.addfont(p); have += 1
     BODY, HEAD = ("Atkinson Hyperlegible", "Bricolage Grotesque") if have == 3 else ("DejaVu Sans", "DejaVu Sans")
@@ -572,8 +597,8 @@ def preview(models, var):
     fdir = os.path.join(HERE, "fonts"); os.makedirs(fdir, exist_ok=True); body = "DejaVu Sans"; site = os.environ.get("SITE_URL", "").rstrip("/")
     for f in ("AtkinsonHyperlegible-Regular.ttf", "AtkinsonHyperlegible-Bold.ttf"):  # the site's font, as for the storm map
         path = os.path.join(fdir, f)
-        if not os.path.exists(path) and site:
-            blob = get(site + "/wp-content/plugins/will-it-snow/assets/fonts/" + f, tries=2, ok404=True)
+        if not os.path.exists(path) and site and site_ok():
+            blob = get(site + "/wp-content/plugins/will-it-snow/assets/fonts/" + f, tries=2, timeout=30, ok404=True)
             if blob and blob[:4] in (b"\x00\x01\x00\x00", b"true", b"OTTO"): open(path, "wb").write(blob)
         if os.path.exists(path): fm.fontManager.addfont(path); body = "Atkinson Hyperlegible"
     tr = Transformer.from_crs("EPSG:4326", "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=38 +lon_0=-96 +units=km", always_xy=True)
@@ -714,28 +739,54 @@ def main():
         stamp = start.strftime("%Y%m%d%H")
         sent = 0
         for key, md in models.items():
-            for name, path in export_grids(md, key).items(): sent += upload_grid(stamp, name, path)
+            for name, path in export_grids(md, key).items():
+                GRIDS[name] = path; sent += upload_grid(stamp, name, path)
         meta["grid"] = dict(GRID, stamp=stamp, steps=STEPS, models=list(models), runs=meta["runs"],
                             vars={"snow": {"type": "u16", "scale": 0.1}, "rain": {"type": "u16", "scale": 0.01}, "temp": {"type": "u8", "offset": -80}})
         log(f"grids: {sent} files sent")
         hi = export_hires({k: models[k] for k in ("nws", "hrrr") if k in models}, stamp)
         repo = os.environ.get("GITHUB_REPOSITORY", "")
         if hi and "/" in repo: meta["grid"]["hires"] = f"https://{repo.split('/')[0].lower()}.github.io/{repo.split('/')[1]}/hires.json"
-        if sent < 3 * len(models): meta.pop("grid")
+        if sent < 3 * len(models) and len(GRIDS) < 3 * len(models): meta.pop("grid")
     except Exception:
         log("grids failed:", traceback.format_exc()[-600:])
     os.makedirs(os.path.join(OUT, "pages"), exist_ok=True)  # GitHub Pages needs the folder, even if empty
-    open(os.path.join(OUT, "pages", "index.html"), "w").write("<!doctype html><title>Weather Scoreboard model data</title><p>Map data for <a href=\"https://www.weatherscoreboard.com/models/\">WeatherScoreboard.com/models</a>.</p>")
+    open(os.path.join(OUT, "pages", "index.html"), "w").write("<!doctype html><title>Weather Scoreboard model data</title><p>Map data for <a href=\"https://www.weatherscoreboard.com/models/\">WeatherScoreboard.com/models</a>.</p>"
+        "<p>These files are published for WeatherScoreboard.com and aren't offered for reuse. Images © Weather Scoreboard. Underlying data: NOAA (public domain); "
+        "ECMWF IFS forecast data © ECMWF, CC BY 4.0; contains information licenced under the Data Server End-use Licence of Environment and Climate Change Canada.</p>")
     meta["log"] = LOG[-60:]  # including the map and grid steps
-    upload(meta, {"runs": meta["runs"], "steps": STEPS, "cities": points}, files)
+    pts = {"runs": meta["runs"], "steps": STEPS, "cities": points}
+    deliver(meta, pts, files)
+    upload(meta, pts, files)
+
+GRIDS = {}
+def deliver(meta, points, files):
+    """The same delivery on GitHub Pages (out/pages/<folder>), for the site to fetch itself when GitHub can't reach it:
+    meta.json, points.json.gz, the grid files, the pictures, and latest.json listing them. Public data only; no key."""
+    import gzip, hashlib, shutil
+    # The folder's name comes from the site's key (WIS_MODELS_KEY), so only the plugin, which has the same key, knows
+    # where to look; the key itself is never published.
+    key = os.environ.get("WIS_MODELS_KEY", "")
+    folder = "d-" + hashlib.sha256(("wis-delivery:" + key).encode()).hexdigest()[:24] if key else "delivery"
+    d = os.path.join(OUT, "pages", folder); os.makedirs(d, exist_ok=True)
+    listed = {"made": meta.get("made"), "stamp": (meta.get("grid") or {}).get("stamp"), "grids": [], "files": []}
+    m = dict(meta); m["via"] = "pages"
+    json.dump(m, open(os.path.join(d, "meta.json"), "w"))
+    open(os.path.join(d, "points.json.gz"), "wb").write(gzip.compress(json.dumps(points, separators=(",", ":")).encode(), 6))
+    if listed["stamp"]:
+        for n, p in GRIDS.items(): shutil.copy(p, os.path.join(d, n)); listed["grids"].append(n)
+    for n, p in (files or {}).items():
+        if os.path.exists(p): shutil.copy(p, os.path.join(d, n)); listed["files"].append(n)
+    json.dump(listed, open(os.path.join(d, "latest.json"), "w"))
+    log(f"delivery on GitHub Pages: {len(listed['grids'])} grids, {len(listed['files'])} pictures")
 
 def upload_grid(stamp, name, path):
     url, key = os.environ.get("SITE_URL", "").rstrip("/"), os.environ.get("WIS_MODELS_KEY", "")
-    if not url or not key: return 0
+    if not url or not key or not site_ok(): return 0
     for i in range(3):
         try:
             r = requests.post(url + "/wp-json/wis/v1/models/grid", headers={**UA, "X-WIS-Key": key}, data={"stamp": stamp},
-                              files={"grid": (name, open(path, "rb"), "application/octet-stream")}, timeout=120)
+                              files={"grid": (name, open(path, "rb"), "application/octet-stream")}, timeout=(15, 120))
             if r.status_code == 200: return 1
             log("  grid", name, r.status_code, r.text[:160])
         except Exception as e:
@@ -746,14 +797,17 @@ def upload_grid(stamp, name, path):
 def upload(meta, points, files):
     url, key = os.environ.get("SITE_URL", "").rstrip("/"), os.environ.get("WIS_MODELS_KEY", "")
     if not url or not key: log("SITE_URL or WIS_MODELS_KEY not set; nothing sent."); return
+    if not site_ok(): log("upload: skipped (the site isn't reachable from GitHub); it will fetch this run from GitHub Pages"); return
     send = {"meta": ("meta.json", json.dumps(meta), "application/json")}
     if points:
         import gzip
         send["points"] = ("points.json.gz", gzip.compress(json.dumps(points, separators=(",", ":")).encode(), 6), "application/gzip")
     for n, p in (files or {}).items(): send[n.replace(".", "_")] = (n, open(p, "rb"), "application/octet-stream")
-    r = requests.post(url + "/wp-json/wis/v1/models", headers={**UA, "X-WIS-Key": key}, files=send, timeout=180)
-    log("upload:", r.status_code, r.text[:300])
-    if r.status_code != 200: sys.exit(1)
+    try:
+        r = requests.post(url + "/wp-json/wis/v1/models", headers={**UA, "X-WIS-Key": key}, files=send, timeout=(15, 180))
+        log("upload:", r.status_code, r.text[:300])
+    except Exception as e:
+        log("upload: failed,", type(e).__name__, "; the site will fetch this run from GitHub Pages")
 
 if __name__ == "__main__":
     main()
