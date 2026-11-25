@@ -599,9 +599,9 @@ PREVIEW_SCALES = {
     "snow": ([0.1, 1, 2, 3, 4, 6, 8, 12, 18, 24, 999], ["#C6DBEF", "#9ECAE1", "#6BAED6", "#4292C6", "#2171B5", "#08519C", "#6A51A3", "#8E3FA8", "#C2378F", "#E7298A"], ["0.1", "1", "2", "3", "4", "6", "8", "12", "18", "24+"]),
     "rain": ([0.01, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 999], ["#D9F0D3", "#ADDDA3", "#78C679", "#41AB5D", "#238443", "#1D91C0", "#225EA8", "#253494", "#7A3E9D", "#B0358B", "#E0218A"], ["0.01", "0.1", "¼", "½", "¾", "1", "1½", "2", "3", "4", "6+"]),
 }
-def preview(models, var):
-    """One still picture for the homepage: one model's total snow (or rain, on a week without snow) over the next
-    7 days across the lower 48, the same colors as the interactive map. Saved as out/preview.jpg."""
+def preview(models, var, name="preview"):
+    """One still picture for the homepage: one model's total snow (or rain) over the next 7 days across the lower 48,
+    the same colors as the interactive map. Saved as out/<name>.jpg."""
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.patheffects as pe
@@ -665,9 +665,9 @@ def preview(models, var):
         if i % 2 and n > 10: continue
         ax.text(lx + lw * i / n, ly - lh * 0.4, lab, fontsize=9, family=body, color="#33445B", va="top", ha="left", zorder=8)
     ax.text(lx + lw, ly + lh * 1.5, "inches", fontsize=9, family=body, color="#33445B", ha="right", va="bottom", zorder=8)
-    png = os.path.join(OUT, "preview.png"); fig.savefig(png, dpi=100, facecolor=fig.get_facecolor()); plt.close(fig)
-    jpg = os.path.join(OUT, "preview.jpg"); Image.open(png).convert("RGB").save(jpg, "JPEG", quality=84, optimize=True, progressive=True)
-    log(f"preview: {pick} {var}, {os.path.getsize(jpg) // 1024} KB")
+    png = os.path.join(OUT, name + ".png"); fig.savefig(png, dpi=100, facecolor=fig.get_facecolor()); plt.close(fig)
+    jpg = os.path.join(OUT, name + ".jpg"); Image.open(png).convert("RGB").save(jpg, "JPEG", quality=84, optimize=True, progressive=True)
+    log(f"{name}: {pick} {var}, {os.path.getsize(jpg) // 1024} KB")
     return dict(model=pick, var=var, hours=last)
 
 # ---------------------------------------------------------------- main
@@ -747,8 +747,16 @@ def main():
     # The homepage picture, every run: 7-day snow if any big city gets an inch in any global model, else rain.
     try:
         week = max((v[-1][2] or 0) for k in globals_ for c, v in points[k].items() if c in {x["k"] for x in big} and v and v[-1][2] is not None)
-        meta["preview"] = preview({k: models[k] for k in globals_}, "snow" if week >= 1 else "rain")
+        auto = "snow" if week >= 1 else "rain"
+        meta["preview"] = preview({k: models[k] for k in globals_}, auto)
         files["preview.jpg"] = os.path.join(OUT, "preview.jpg")
+        # Both pictures as well, so the site can show rain on a snowy week (or snow on a rainy one) when asked to.
+        import shutil
+        shutil.copy(os.path.join(OUT, "preview.jpg"), os.path.join(OUT, f"preview_{auto}.jpg")); files[f"preview_{auto}.jpg"] = os.path.join(OUT, f"preview_{auto}.jpg")
+        meta["preview"][auto] = meta["preview"]["model"]
+        other = "rain" if auto == "snow" else "snow"
+        meta["preview"][other] = preview({k: models[k] for k in globals_}, other, f"preview_{other}")["model"]
+        files[f"preview_{other}.jpg"] = os.path.join(OUT, f"preview_{other}.jpg")
     except Exception:
         log("preview failed:", traceback.format_exc()[-600:])
     # Grids for the interactive map, sent first; the meta that follows switches the site over to them.
@@ -822,7 +830,7 @@ def upload(meta, points, files):
     for n, p in (files or {}).items(): send[n.replace(".", "_")] = (n, open(p, "rb"), "application/octet-stream")
     try:
         r = requests.post(url + "/wp-json/wis/v1/models", headers={**UA, "X-WIS-Key": key}, files=send, timeout=(15, 180))
-        log("upload: " + str(r.status_code) + " " + r.text[:300])
+        log("upload:", r.status_code, r.text[:300])
     except Exception as e:
         log("upload: failed,", type(e).__name__, "; the site will fetch this run from GitHub Pages")
 
