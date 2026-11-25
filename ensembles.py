@@ -37,10 +37,11 @@ def eens(cyc):
     from ecmwf.opendata import Client
     import pygrib
     target = os.path.join(M.OUT, "eens.grib2"); err = None
-    for src in ("aws", "ecmwf", "azure"):
+    for src in ("ecmwf", "azure", "aws"):   # ECMWF's own server first; the cloud copies can answer "slow down" (503)
         try:
             t0 = time.time()
-            M.limited(1500, Client(source=src).retrieve, date=cyc.strftime("%Y%m%d"), time=cyc.hour, stream="enfo",
+            # At most 10 minutes per source, then the next one.
+            M.limited(600, Client(source=src).retrieve, date=cyc.strftime("%Y%m%d"), time=cyc.hour, stream="enfo",
                       type=["cf", "pf"], step=WINDOWS, param=["tp", "sf"], target=target)
             log(f"  ENS from {src}: {os.path.getsize(target) // (1 << 20)} MB in {time.time() - t0:.0f}s"); err = None; break
         except Exception as e:
