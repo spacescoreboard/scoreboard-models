@@ -1,8 +1,8 @@
 """Weather Scoreboard ensemble job (the snow and rain odds, and the ensembles on the models map).
 
 Twice a day (see .github/workflows/ensembles.yml) this script:
-  1. downloads the two big ensembles: the European ENS (ECMWF open data, 51 runs: a control and 50 variations) and the
-     American GEFS (NOAA, 31 runs);
+  1. downloads the two big ensembles: the European ENS (ECMWF open data, its 50 variations) and the American GEFS
+     (NOAA, 31 runs);
   2. adds up, for every run, total snow and total rain every 12 hours out to 7 days;
   3. saves for every Weather Scoreboard city each run's totals over 3 and 7 days (the website works out the odds,
      ranges and charts from them), and, for the models map, on the same grid as the other models:
@@ -36,13 +36,13 @@ def runs(lag, every):
 
 # ---------------------------------------------------------------- European ENS (ECMWF open data, CC BY 4.0)
 # Snowfall (sf) and total precipitation (tp) add up from the start of the run, so only the 12-hourly times are needed.
-# Only the 00 and 12 UTC runs go past day 6, so those are the ones used. The control run (cf) and the 50 variations (pf)
-# are separate downloads; when the control run isn't there, the 50 variations are used on their own.
+# Only the 00 and 12 UTC runs go past day 6, so those are the ones used. The 50 variations (pf) only: the control run
+# isn't published with snowfall in the open data, and asking for it cost 20 minutes of failed lookups.
 def eens(cyc):
     from ecmwf.opendata import Client
     import pygrib
     tp, sf = {}, {}; lat = lon = None
-    for kind in ("cf", "pf"):
+    for kind in ("pf",):
         target = os.path.join(M.OUT, f"eens-{kind}.grib2"); err = None
         for src in ("ecmwf", "azure", "aws"):   # ECMWF's own server first; the cloud copies can answer "slow down" (503)
             try:
@@ -53,15 +53,11 @@ def eens(cyc):
                 log(f"  ENS {kind} from {src}: {os.path.getsize(target) // (1 << 20)} MB in {time.time() - t0:.0f}s"); err = None; break
             except Exception as e:
                 err = e; log(f"  ENS {kind} source {src} failed: {type(e).__name__} {str(e)[:160]}")
-        if err:
-            # The control run isn't always published with every field; the 50 variations are what matter for the odds.
-            if kind == "cf": log("  ENS: control run not available, using the 50 variations"); continue
-            raise RuntimeError(f"ENS {kind} not available")
+        if err: raise RuntimeError(f"ENS {kind} not available")
         with pygrib.open(target) as g:
             for m in g:
                 try: n = int(m["perturbationNumber"])
                 except Exception: n = 0
-                if kind == "cf": n = 0
                 try: s = M.step_hours(m.endStep)
                 except Exception: s = M.step_hours(m.step)
                 lats, lons = m.latlons()
