@@ -1,0 +1,41 @@
+name: Ensembles
+
+# The snow and rain odds from the European and American ensembles, twice a day (about 4:50 AM and 4:50 PM Eastern),
+# after both ensembles' runs are published. The results go to this repository's ens-data branch, where the website
+# collects them. Separate from the Forecast models job, so neither can hold up the other.
+on:
+  schedule:
+    - cron: "50 9 * * *"
+    - cron: "50 21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ensembles
+  cancel-in-progress: false
+
+jobs:
+  ensembles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+      - name: Download the ensembles and work out the odds
+        run: python ensembles.py
+      - name: Publish the odds to the ens-data branch
+        run: |
+          cd out/ens
+          git init -q -b ens-data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Ensemble odds $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" ens-data
