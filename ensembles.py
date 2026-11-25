@@ -37,7 +37,7 @@ def runs(lag, every):
 # ---------------------------------------------------------------- European ENS (ECMWF open data, CC BY 4.0)
 # Snowfall (sf) and total precipitation (tp) add up from the start of the run, so only the 12-hourly times are needed.
 # Only the 00 and 12 UTC runs go past day 6, so those are the ones used. The control run (cf) and the 50 variations (pf)
-# are separate downloads, so all 51 are counted.
+# are separate downloads; when the control run isn't there, the 50 variations are used on their own.
 def eens(cyc):
     from ecmwf.opendata import Client
     import pygrib
@@ -53,7 +53,10 @@ def eens(cyc):
                 log(f"  ENS {kind} from {src}: {os.path.getsize(target) // (1 << 20)} MB in {time.time() - t0:.0f}s"); err = None; break
             except Exception as e:
                 err = e; log(f"  ENS {kind} source {src} failed: {type(e).__name__} {str(e)[:160]}")
-        if err: raise RuntimeError(f"ENS {kind} not available")
+        if err:
+            # The control run isn't always published with every field; the 50 variations are what matter for the odds.
+            if kind == "cf": log("  ENS: control run not available, using the 50 variations"); continue
+            raise RuntimeError(f"ENS {kind} not available")
         with pygrib.open(target) as g:
             for m in g:
                 try: n = int(m["perturbationNumber"])
