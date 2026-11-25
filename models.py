@@ -404,8 +404,8 @@ def draw(models, totals, force=False):
             blob = get(site + "/wp-content/plugins/will-it-snow/assets/fonts/" + f, tries=2, timeout=30, ok404=True)
             if blob and blob[:4] in (b"\x00\x01\x00\x00", b"true", b"OTTO"): open(p, "wb").write(blob)
         if os.path.exists(p): fm.fontManager.addfont(p); have += 1
+    log(f"  fonts: {have} of 3 site fonts found" + ("" if have == 3 else " (upload the fonts folder to this repo so the job doesn't need the website for them)"))
     BODY, HEAD = ("Atkinson Hyperlegible", "Bricolage Grotesque") if have == 3 else ("DejaVu Sans", "DejaVu Sans")
-    if have < 3: log("  fonts: using DejaVu Sans (the site's fonts weren't found)")
     INK, SLATE, LINE, WATER, LAND = "#14233A", "#4A5A70", "#B9C6D3", "#DCE8F2", "#F4F6F8"
 
     # Where: around the big cities with 4+ inches in any model (or the snowiest cities when forced).
@@ -479,10 +479,12 @@ def draw(models, totals, force=False):
     frames = []
     for f in MAP_STEPS[1:]:
         fig = plt.figure(figsize=(12, 5.4), dpi=100, facecolor="white")
-        fig.text(0.025, 0.93, headline, fontfamily=HEAD, fontsize=21, color=INK, fontweight="heavy")
+        hl = fig.text(0.025, 0.93, headline, fontfamily=HEAD, fontsize=21, color=INK, fontweight="heavy")
         fig.text(0.025, 0.885, f"Total snow since {clock(0)} ET", fontfamily=BODY, fontsize=12, color=SLATE)
         runs = " · ".join(f"{names[k].split(' ')[0]} {models[k]['run'].strftime('%HZ %b %-d')}" for k in order)
-        fig.text(0.975, 0.925, "Model runs: " + runs, fontfamily=BODY, fontsize=9.5, color=SLATE, ha="right")
+        mr = fig.text(0.975, 0.925, "Model runs: " + runs, fontfamily=BODY, fontsize=9.5, color=SLATE, ha="right")
+        rd = fig.canvas.get_renderer()  # never let the headline run into the model runs (it's wider in the standard font)
+        while hl.get_window_extent(rd).x1 > mr.get_window_extent(rd).x0 - 24 and hl.get_fontsize() > 14: hl.set_fontsize(hl.get_fontsize() - 1)
         fig.text(0.975, 0.872, clock(f) + " ET", fontfamily=HEAD, fontsize=16, fontweight="heavy", color=INK, ha="right")
         tb = fig.add_axes([0.66, 0.862, 0.17, 0.012]); tb.set_axis_off(); tb.set_xlim(0, 72); tb.set_ylim(0, 1)
         tb.add_patch(plt.Rectangle((0, 0), 72, 1, color="#E6EDF4")); tb.add_patch(plt.Rectangle((0, 0), f, 1, color="#2E5EAA"))
@@ -820,7 +822,7 @@ def upload(meta, points, files):
     for n, p in (files or {}).items(): send[n.replace(".", "_")] = (n, open(p, "rb"), "application/octet-stream")
     try:
         r = requests.post(url + "/wp-json/wis/v1/models", headers={**UA, "X-WIS-Key": key}, files=send, timeout=(15, 180))
-        log("upload:", r.status_code, r.text[:300])
+        log("upload: " + str(r.status_code) + " " + r.text[:300])
     except Exception as e:
         log("upload: failed,", type(e).__name__, "; the site will fetch this run from GitHub Pages")
 
