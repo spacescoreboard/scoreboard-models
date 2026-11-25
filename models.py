@@ -204,8 +204,13 @@ def ecmwf(cyc):
 
 # ---------------------------------------------------------------- Canadian GDPS / GEM (ECCC Data Server End-use Licence)
 def gem(cyc):
-    hh = cyc.strftime("%H"); base = f"https://dd.weather.gc.ca/today/model_gdps/15km/{hh}/"
-    listing = get(base + "024/", ok404=True)
+    # Each run is kept in a folder named for its date (UTC), for 30 days. ("today" only holds the current UTC day, so
+    # after 7 PM Eastern it no longer has that day's runs.) The "today" folder is the fallback.
+    hh = cyc.strftime("%H"); listing = None
+    for base in (f"https://dd.weather.gc.ca/{cyc:%Y%m%d}/WXO-DD/model_gdps/15km/{hh}/", f"https://dd.weather.gc.ca/today/model_gdps/15km/{hh}/"):
+        listing = get(base + "024/", tries=2, ok404=True)
+        if listing and cyc.strftime("%Y%m%dT%HZ").encode() in listing: break
+        listing = None
     if not listing: raise RuntimeError("GEM run not listed")
     names = re.findall(r'href="([^"]+\.grib2)"', listing.decode("utf-8", "ignore"))
     stamp = cyc.strftime("%Y%m%dT%HZ")
