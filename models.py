@@ -104,12 +104,15 @@ def step_hours(v):
     else: h = int(float(t))
     return int(h) if h == int(h) else h
 
-def cycle_candidates(lag=5):
-    """Most recent 00/12 UTC runs, newest first, allowing `lag` hours for a run to be published (the European's open
-    data comes out about 7 to 8 hours after its start time, the others about 4 to 5)."""
+def cycle_candidates(lag=5, every=12):
+    """Most recent runs, newest first, allowing `lag` hours for a run to be published (the European's open data comes
+    out about 7 to 8 hours after its start time, the others about 4 to 5). `every` is 12 for models used at 00 and
+    12 UTC, or 6 for the American (GFS), whose 06 and 18 UTC runs also go the full 16 days. The scheduled jobs
+    (4:20 AM and 4:20 PM ET) still land on the 00 and 12 UTC runs, which the Model Scoreboard grades; a run started
+    by hand in between picks up the American's newer 06 or 18 UTC run."""
     now = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=lag)
-    c = now.replace(minute=0, second=0, microsecond=0, hour=0 if now.hour < 12 else 12)
-    return [c, c - dt.timedelta(hours=12), c - dt.timedelta(hours=24)]
+    c = now.replace(minute=0, second=0, microsecond=0, hour=now.hour // every * every)
+    return [c - dt.timedelta(hours=every * i) for i in range(3 if every == 12 else 5)]
 
 def subset(lats, lons, *fields):
     """Cut a global grid to North America; longitudes as -180..180."""
@@ -706,7 +709,9 @@ def main():
     for key, fn in (("gfs", gfs), ("ecmwf", ecmwf), ("gem", gem)):
         if not budget(15):
             log(f"{key}: skipped, out of time"); continue
-        for cyc in cycle_candidates(8 if key == "ecmwf" else 5):
+        # The European's 06/18 UTC runs stop at day 6 (we use 7) and the Canadian runs only at 00/12, so only the
+        # American uses all four daily runs.
+        for cyc in cycle_candidates(8 if key == "ecmwf" else 5, 6 if key == "gfs" else 12):
             try:
                 log(f"{key}: trying the {cyc:%Y-%m-%d %HZ} run"); t0 = time.time()
                 models[key] = fn(cyc); notes[key] = models[key]["snow_note"]
